@@ -3,12 +3,10 @@ import numpy as np
 from torch.nn.utils.rnn import pad_sequence
 from tqdm import tqdm
 import torch
-from meshgpt_pytorch import (
-    MeshAutoencoder,
-    MeshTransformer
-)
+from model_scripts.autoencoder import MeshAutoencoder
+from model_scripts.transformer import MeshTransformer
 
-from helper_funcs import (
+from data_scripts.helper_funcs import (
     derive_face_edges_from_faces
 )
 

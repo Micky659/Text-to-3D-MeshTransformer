@@ -51,7 +51,7 @@ def best_decimated_mesh(original_path):
     return best_path or original_path  # fallback
 
 
-def load_shapenet_data(dir_path, label_path, mesh_per_category, var):
+def load_shapenet_data(dir_path, label_path, mesh_per_category, var, MAX_FILE_SIZE):
     mesh_dataset = []
     category_counts = {}
 
@@ -62,7 +62,7 @@ def load_shapenet_data(dir_path, label_path, mesh_per_category, var):
         for entry in label_list
     }
 
-    scale_factors = np.random.uniform(0.75, 1.25, size=var)
+    scale_factors = np.random.uniform(0.75, 1.00, size=var)
 
     for synset in os.listdir(dir_path):
         cat_path = os.path.join(dir_path, synset)
@@ -71,8 +71,9 @@ def load_shapenet_data(dir_path, label_path, mesh_per_category, var):
 
         category_counts[synset] = 0
         print(f"{synset} → {label_dict[synset]} has {len(os.listdir(cat_path))} instances")
-
+        rem_ins = len(os.listdir(cat_path))
         for inst in os.listdir(cat_path):
+            rem_ins = rem_ins - 1
             if category_counts[synset] >= mesh_per_category:
                 break
 
@@ -82,23 +83,28 @@ def load_shapenet_data(dir_path, label_path, mesh_per_category, var):
             if not os.path.isfile(obj_file):
                 continue
 
-            dec_path = best_decimated_mesh(obj_file)
-            vertices, faces = get_mesh_data(dec_path)
+            # if os.path.getsize(obj_file) > MAX_FILE_SIZE * 1024:
+            #     continue
+
+            # dec_path = best_decimated_mesh(obj_file)
+            vertices, faces = get_mesh_data(obj_file)
             if len(faces) > MAX_FACE_COUNT:
                 continue
 
             category_counts[synset] += 1
-            text_label = label_dict[synset]
+            text_label = label_dict[synset].replace(",", " ")
+            faces = torch.tensor(faces.tolist(), dtype=torch.long).to('cuda')
             face_edges = derive_face_edges_from_faces(faces)
 
             for scale in scale_factors:
                 aug_v = augment_mesh(vertices.copy(), scale)
                 mesh_dataset.append({
                     'vertices': torch.tensor(aug_v.tolist(), dtype=torch.float).to('cuda'),
-                    'faces':    torch.tensor(faces.tolist(), dtype=torch.long).to('cuda'),
+                    'faces':    faces,
                     'face_edges': face_edges,
                     'texts': text_label
                 })
+            print("Added ", len(scale_factors), "variations of ", text_label, " Remaining ins: ", rem_ins)
 
     print('=' * 30)
     print("Models per category:")
@@ -110,14 +116,29 @@ def load_shapenet_data(dir_path, label_path, mesh_per_category, var):
 
 
 if __name__ == '__main__':
-    shapenet_dir = ''  # TODO: set this
-    labels_dir = ''    # TODO: set this
-    working_dir = Path('./Data')
+    script_dir = Path(__file__).resolve().parent
+    project_root = script_dir.parent
+
+    shapenet_dir = project_root / 'Data/ShapeNetCore.v2'  # TODO: set this
+    labels_dir = project_root / 'Data/ShapeNetCore.v2/taxonomy.json'    # TODO: set this
+
+    working_dir = project_root / "Data"
     working_dir.mkdir(exist_ok=True, parents=True)
     dataset_path = working_dir / "meshData.npz"
 
-    if not os.path.isfile(dataset_path):
-        data = load_shapenet_data(shapenet_dir, labels_dir, 500, 10)
-        dataset = MeshDataset(data)
-        dataset.generate_face_edges()
-        dataset.save(dataset_path)
+    # if not os.path.isfile(dataset_path):
+
+    # data = load_shapenet_data(shapenet_dir, labels_dir, 500, 3, 5048)
+    # dataset = MeshDataset(data)
+    # dataset.generate_face_edges()
+    # dataset.save(dataset_path+"_1")
+
+    data = load_shapenet_data(shapenet_dir, labels_dir, 500, 2, 500)
+    dataset = MeshDataset(data)
+    dataset.generate_face_edges()
+    dataset.save(working_dir / "meshData_15_500.npz")
+
+    # data = load_shapenet_data(shapenet_dir, labels_dir, 500, 7, 1024)
+    # dataset = MeshDataset(data)
+    # dataset.generate_face_edges()
+    # dataset.save(working_dir / "meshData_7_1024.npz")

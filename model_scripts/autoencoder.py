@@ -31,8 +31,8 @@ from taylor_series_linear_attention import TaylorSeriesLinearAttn
 from torch_geometric.nn.conv import SAGEConv
 
 from data_scripts.helper_funcs import *
-from resnet import ResnetBlock
-from data_scripts.typing import Float, Int, Bool
+from model_scripts.resnet import ResnetBlock
+from data_scripts.typing_mod import Float, Int, Bool
 
 
 @save_load()

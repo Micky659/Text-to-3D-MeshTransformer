@@ -16,7 +16,7 @@ from einops.layers.torch import Rearrange
 
 from torchtyping import TensorType
 
-from typing import typecheck, Float
+from data_scripts.typing_mod import typecheck, Float
 
 
 def get_mesh_data(file_path):
@@ -68,16 +68,16 @@ def augment_mesh(vertices, scale_factor):
 def exists(v):
     return v is not None
 
+
 def default(v, d):
     return v if exists(v) else d
 
-def divisible_by(num, den):
-    return (num % den) == 0
 
 def cycle(dl):
     while True:
         for data in dl:
             yield data
+
 
 def maybe_del(d: dict, *keys):
     for key in keys:
@@ -90,33 +90,42 @@ def maybe_del(d: dict, *keys):
 def first(it):
     return it[0]
 
+
 def identity(t, *args, **kwargs):
     return t
+
 
 def divisible_by(num, den):
     return (num % den) == 0
 
+
 def is_odd(n):
     return not divisible_by(n, 2)
+
 
 def is_empty(x):
     return len(x) == 0
 
+
 def is_tensor_empty(t: Tensor):
     return t.numel() == 0
 
+
 def set_module_requires_grad_(
-    module: Module,
-    requires_grad: bool
+        module: Module,
+        requires_grad: bool
 ):
     for param in module.parameters():
         param.requires_grad = requires_grad
 
+
 def l1norm(t):
-    return F.normalize(t, dim = -1, p = 1)
+    return F.normalize(t, dim=-1, p=1)
+
 
 def l2norm(t):
-    return F.normalize(t, dim = -1, p = 2)
+    return F.normalize(t, dim=-1, p=2)
+
 
 def safe_cat(tensors, dim):
     tensors = [*filter(exists, tensors)]
@@ -126,15 +135,17 @@ def safe_cat(tensors, dim):
     elif len(tensors) == 1:
         return first(tensors)
 
-    return torch.cat(tensors, dim = dim)
+    return torch.cat(tensors, dim=dim)
 
-def pad_at_dim(t, padding, dim = -1, value = 0):
+
+def pad_at_dim(t, padding, dim=-1, value=0):
     ndim = t.ndim
     right_dims = (ndim - dim - 1) if dim >= 0 else (-dim - 1)
     zeros = (0, 0) * right_dims
-    return F.pad(t, (*zeros, *padding), value = value)
+    return F.pad(t, (*zeros, *padding), value=value)
 
-def pad_to_length(t, length, dim = -1, value = 0, right = True):
+
+def pad_to_length(t, length, dim=-1, value=0, right=True):
     curr_length = t.shape[dim]
     remainder = length - curr_length
 
@@ -142,21 +153,23 @@ def pad_to_length(t, length, dim = -1, value = 0, right = True):
         return t
 
     padding = (0, remainder) if right else (remainder, 0)
-    return pad_at_dim(t, padding, dim = dim, value = value)
+    return pad_at_dim(t, padding, dim=dim, value=value)
 
-def masked_mean(tensor, mask, dim = -1, eps = 1e-5):
+
+def masked_mean(tensor, mask, dim=-1, eps=1e-5):
     if not exists(mask):
-        return tensor.mean(dim = dim)
+        return tensor.mean(dim=dim)
 
     mask = rearrange(mask, '... -> ... 1')
     tensor = tensor.masked_fill(~mask, 0.)
 
-    total_el = mask.sum(dim = dim)
-    num = tensor.sum(dim = dim)
-    den = total_el.float().clamp(min = eps)
+    total_el = mask.sum(dim=dim)
+    num = tensor.sum(dim=dim)
+    den = total_el.float().clamp(min=eps)
     mean = num / den
     mean = mean.masked_fill(total_el == 0, 0.)
     return mean
+
 
 # continuous embed
 
@@ -169,49 +182,52 @@ def ContinuousEmbed(dim_cont):
         nn.LayerNorm(dim_cont)
     )
 
+
 # additional encoder features
 # 1. angle (3), 2. area (1), 3. normals (3)
 
-def derive_angle(x, y, eps = 1e-5):
+def derive_angle(x, y, eps=1e-5):
     z = einsum('... d, ... d -> ...', l2norm(x), l2norm(y))
     return z.clip(-1 + eps, 1 - eps).arccos()
+
 
 @torch.no_grad()
 @typecheck
 def get_derived_face_features(
-    face_coords: Float['b nf nvf 3']  # 3 or 4 vertices with 3 coordinates
+        face_coords: Float['b nf nvf 3']  # 3 or 4 vertices with 3 coordinates
 ):
     is_quad = face_coords.shape[-2] == 4
 
     # shift face coordinates depending on triangles or quads
 
-    shifted_face_coords = torch.roll(face_coords, 1, dims = (2,))
+    shifted_face_coords = torch.roll(face_coords, 1, dims=(2,))
 
-    angles  = derive_angle(face_coords, shifted_face_coords)
+    angles = derive_angle(face_coords, shifted_face_coords)
 
     if is_quad:
         # @sbriseid says quads need to be shifted by 2
-        shifted_face_coords = torch.roll(shifted_face_coords, 1, dims = (2,))
+        shifted_face_coords = torch.roll(shifted_face_coords, 1, dims=(2,))
 
-    edge1, edge2, *_ = (face_coords - shifted_face_coords).unbind(dim = 2)
+    edge1, edge2, *_ = (face_coords - shifted_face_coords).unbind(dim=2)
 
-    cross_product = torch.cross(edge1, edge2, dim = -1)
+    cross_product = torch.cross(edge1, edge2, dim=-1)
 
     normals = l2norm(cross_product)
-    area = cross_product.norm(dim = -1, keepdim = True) * 0.5
+    area = cross_product.norm(dim=-1, keepdim=True) * 0.5
 
     return dict(
-        angles = angles,
-        area = area,
-        normals = normals
+        angles=angles,
+        area=area,
+        normals=normals
     )
+
 
 @typecheck
 def discretize(
-    t: Tensor,
-    *,
-    continuous_range: Tuple[float, float],
-    num_discrete: int = 128
+        t: Tensor,
+        *,
+        continuous_range: Tuple[float, float],
+        num_discrete: int = 128
 ) -> Tensor:
     lo, hi = continuous_range
     assert hi > lo
@@ -220,14 +236,15 @@ def discretize(
     t *= num_discrete
     t -= 0.5
 
-    return t.round().long().clamp(min = 0, max = num_discrete - 1)
+    return t.round().long().clamp(min=0, max=num_discrete - 1)
+
 
 @typecheck
 def undiscretize(
-    t: Tensor,
-    *,
-    continuous_range = Tuple[float, float],
-    num_discrete: int = 128
+        t: Tensor,
+        *,
+        continuous_range=Tuple[float, float],
+        num_discrete: int = 128
 ) -> Tensor:
     lo, hi = continuous_range
     assert hi > lo
@@ -238,55 +255,54 @@ def undiscretize(
     t /= num_discrete
     return t * (hi - lo) + lo
 
+
 @typecheck
 def gaussian_blur_1d(
-    t: Tensor,
-    *,
-    sigma: float = 1.
+        t: Tensor,
+        *,
+        sigma: float = 1.
 ) -> Tensor:
-
     _, _, channels, device, dtype = *t.shape, t.device, t.dtype
 
     width = int(ceil(sigma * 5))
     width += (width + 1) % 2
     half_width = width // 2
 
-    distance = torch.arange(-half_width, half_width + 1, dtype = dtype, device = device)
+    distance = torch.arange(-half_width, half_width + 1, dtype=dtype, device=device)
 
     gaussian = torch.exp(-(distance ** 2) / (2 * sigma ** 2))
     gaussian = l1norm(gaussian)
 
-    kernel = repeat(gaussian, 'n -> c 1 n', c = channels)
+    kernel = repeat(gaussian, 'n -> c 1 n', c=channels)
 
     t = rearrange(t, 'b n c -> b c n')
-    out = F.conv1d(t, kernel, padding = half_width, groups = channels)
+    out = F.conv1d(t, kernel, padding=half_width, groups=channels)
     return rearrange(out, 'b c n -> b n c')
+
 
 @typecheck
 def scatter_mean(
-    tgt: Tensor,
-    indices: Tensor,
-    src = Tensor,
-    *,
-    dim: int = -1,
-    eps: float = 1e-5
+        tgt: Tensor,
+        indices: Tensor,
+        src=Tensor,
+        *,
+        dim: int = -1,
+        eps: float = 1e-5
 ):
     """
     todo: update to pytorch 2.1 and try https://pytorch.org/docs/stable/generated/torch.Tensor.scatter_reduce_.html#torch.Tensor.scatter_reduce_
     """
     num = tgt.scatter_add(dim, indices, src)
     den = torch.zeros_like(tgt).scatter_add(dim, indices, torch.ones_like(src))
-    return num / den.clamp(min = eps)
-
+    return num / den.clamp(min=eps)
 
 
 def derive_face_edges_from_faces(
-    faces: TensorType['b', 'nf', 3, int],
-    pad_id = -1,
-    neighbor_if_share_one_vertex = False,
-    include_self = True
+        faces: TensorType['b', 'nf', 3, int],
+        pad_id=-1,
+        neighbor_if_share_one_vertex=False,
+        include_self=True
 ) -> TensorType['b', 'e', 2, int]:
-
     is_one_face, device = faces.ndim == 2, faces.device
 
     if is_one_face:
@@ -296,9 +312,9 @@ def derive_face_edges_from_faces(
     face_edges_vertices_threshold = 1 if neighbor_if_share_one_vertex else 2
 
     all_edges = torch.stack(torch.meshgrid(
-        torch.arange(max_num_faces, device = device),
-        torch.arange(max_num_faces, device = device),
-    indexing = 'ij'), dim = -1)
+        torch.arange(max_num_faces, device=device),
+        torch.arange(max_num_faces, device=device),
+        indexing='ij'), dim=-1)
 
     face_masks = reduce(faces != pad_id, 'b nf c -> b nf', 'all')
     face_edges_masks = rearrange(face_masks, 'b i -> b i 1') & rearrange(face_masks, 'b j -> b 1 j')
@@ -308,7 +324,7 @@ def derive_face_edges_from_faces(
     for face, face_edge_mask in zip(faces, face_edges_masks):
 
         shared_vertices = rearrange(face, 'i c -> i 1 c 1') == rearrange(face, 'j c -> 1 j 1 c')
-        num_shared_vertices = shared_vertices.any(dim = -1).sum(dim = -1)
+        num_shared_vertices = shared_vertices.any(dim=-1).sum(dim=-1)
 
         is_neighbor_face = (num_shared_vertices >= face_edges_vertices_threshold) & face_edge_mask
 
@@ -318,19 +334,17 @@ def derive_face_edges_from_faces(
         face_edge = all_edges[is_neighbor_face]
         face_edges.append(face_edge)
 
-    face_edges = pad_sequence(face_edges, padding_value = pad_id, batch_first = True)
+    face_edges = pad_sequence(face_edges, padding_value=pad_id, batch_first=True)
 
     if is_one_face:
         face_edges = rearrange(face_edges, '1 e ij -> e ij')
 
     return face_edges
 
+
 # custom collater
 
-def first(it):
-    return it[0]
-
-def custom_collate(data, pad_id = -1):
+def custom_collate(data, pad_id=-1):
     is_dict = isinstance(first(data), dict)
 
     if is_dict:
@@ -341,7 +355,7 @@ def custom_collate(data, pad_id = -1):
 
     for datum in zip(*data):
         if is_tensor(first(datum)):
-            datum = pad_sequence(datum, batch_first = True, padding_value = pad_id)
+            datum = pad_sequence(datum, batch_first=True, padding_value=pad_id)
         else:
             datum = list(datum)
             output.append(datum)

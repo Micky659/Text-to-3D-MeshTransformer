@@ -16,7 +16,7 @@ from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
 
 from beartype.typing import Tuple, Type, List
-from data_scripts.typing import typecheck, beartype_isinstance
+from data_scripts.typing_mod import typecheck, beartype_isinstance
 
 from data_scripts.helper_funcs import *
 

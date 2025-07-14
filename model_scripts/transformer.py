@@ -29,9 +29,9 @@ from gateloop_transformer import SimpleGateLoopLayer
 from tqdm import tqdm
 
 from data_scripts.helper_funcs import *
-from resnet import FiLM
-from data_scripts.typing import Int
-from autoencoder import MeshAutoencoder
+from model_scripts.resnet import FiLM
+from data_scripts.typing_mod import Int
+from model_scripts.autoencoder import MeshAutoencoder
 
 
 class GateLoopBlock(Module):
