@@ -289,14 +289,18 @@ class MeshAutoencoderTrainer(Module):
 
         self.print('training complete')
 
-    def train(self, num_epochs, stop_at_loss = None, diplay_graph = False):
+    def train(self, num_epochs, stop_at_loss = None, diplay_graph = False, start_epoch=0):
         epoch_losses, epoch_recon_losses, epoch_commit_losses = [] , [] ,[]
         self.model.train()
 
-        for epoch in range(num_epochs):
+        for local_idx in range(num_epochs):
+            epoch = start_epoch + local_idx  # actual epoch number
             total_epoch_loss, total_epoch_recon_loss, total_epoch_commit_loss = 0.0, 0.0, 0.0
 
-            progress_bar = tqdm(enumerate(self.dataloader), desc=f'Epoch {epoch + 1}/{num_epochs}', total=len(self.dataloader))
+            progress_bar = tqdm(
+                enumerate(self.dataloader),
+                desc=f'Epoch {epoch + 1}/{start_epoch + num_epochs}',
+                total=len(self.dataloader))
             for batch_idx, batch in progress_bar:
                 is_last = (batch_idx +1) % self.grad_accum_every == 0
                 maybe_no_sync = partial(self.accelerator.no_sync, self.model) if not is_last else nullcontext
