@@ -3,12 +3,15 @@ import numpy as np
 from torch.nn.utils.rnn import pad_sequence
 from tqdm import tqdm
 import torch
+import trimesh
+
 from model_scripts.autoencoder import MeshAutoencoder
 from model_scripts.transformer import MeshTransformer
 
 from data_scripts.helper_funcs import (
     derive_face_edges_from_faces
 )
+from data_scripts.BPT import BPT_serialize
 
 
 class MeshDataset(Dataset):
@@ -78,7 +81,7 @@ class MeshDataset(Dataset):
         ]
 
     def generate_face_edges(self, batch_size=5):
-        data_to_process = [item for item in self.data if 'faces_edges' not in item]
+        data_to_process = [item for item in self.data if 'face_edges' not in item]
 
         total_batches = (len(data_to_process) + batch_size - 1) // batch_size
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -153,3 +156,68 @@ class MeshDataset(Dataset):
 
         self.sort_dataset_keys()
         print(f"[MeshDataset] Generated {len(text_embedding_dict)} text_embeddings")
+
+
+    def generate_codes_bpt(self, batch_size: int = 25, pad_id: int = -1,
+                           block_size: int = 8, offset_size: int = 16,
+                           use_special_block: bool = True):
+        """
+        Generate BPT codes for each sample and store them under item['codes'].
+        This is CPU-side and operates on per-item meshes (trimesh).
+        """
+        total_batches = (len(self.data) + batch_size - 1) // batch_size
+
+        for i in tqdm(range(0, len(self.data), batch_size), total=total_batches):
+            batch_data = self.data[i:i + batch_size]
+
+            for item in batch_data:
+                # extract vertices and faces (handle torch.Tensor or numpy arrays)
+                verts = item.get('vertices', None)
+                faces = item.get('faces', None)
+                if verts is None or faces is None:
+                    # skip malformed entry
+                    item['codes'] = torch.tensor([], dtype=torch.long)
+                    continue
+
+                if isinstance(verts, torch.Tensor):
+                    verts_np = verts.cpu().numpy()
+                else:
+                    verts_np = np.asarray(verts)
+
+                if isinstance(faces, torch.Tensor):
+                    faces_np = faces.cpu().numpy()
+                else:
+                    faces_np = np.asarray(faces)
+
+                # remove any padded faces (negative indices or indices >= num verts)
+                if faces_np.size == 0:
+                    item['codes'] = torch.tensor([], dtype=torch.long)
+                    continue
+
+                # Only keep rows that are valid (all indices in range)
+                valid_mask = np.all((faces_np >= 0) & (faces_np < len(verts_np)), axis=1)
+                faces_clean = faces_np[valid_mask]
+
+                if faces_clean.size == 0:
+                    item['codes'] = torch.tensor([], dtype=torch.long)
+                    continue
+
+                # construct trimesh and call BPT serialize
+                try:
+                    mesh = trimesh.Trimesh(vertices=verts_np, faces=faces_clean, process=False)
+                    codes = BPT_serialize(mesh)  # returns numpy array of int codes
+                except Exception as e:
+                    # on failure produce empty tensor and continue
+                    print(f"[generate_codes_bpt] failed for item idx with error: {e}")
+                    item['codes'] = torch.tensor([], dtype=torch.long)
+                    continue
+
+                # store as torch.LongTensor for downstream collate/padding
+                if isinstance(codes, np.ndarray):
+                    item['codes'] = torch.from_numpy(codes.astype(np.int64)).long()
+                else:
+                    # if BPT returns list
+                    item['codes'] = torch.tensor(codes, dtype=torch.long)
+
+        self.sort_dataset_keys()
+        print(f"[MeshDataset] Generated BPT codes for {len(self.data)} entries (pad_id={pad_id})")

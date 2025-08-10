@@ -71,6 +71,21 @@ autoencoder_trainer = MeshAutoencoderTrainer(model =autoencoder ,warmup_steps = 
 # )
 
 
+# --- Optional: precompute BPT codes for transformer training later.
+# Set this to True if you want to generate BPT tokenization for every mesh and store it into dataset['codes'].
+# This does not affect autoencoder training, but helps when you later train a transformer on BPT tokens.
+# use_bpt = False
+# if use_bpt:
+#     print("[encoder_training_main] Generating BPT codes for dataset (this may be slow)...")
+#     # defaults match Tencent BPT settings
+#     dataset.generate_codes_bpt(batch_size=32, pad_id=-1, block_size=8, offset_size=16, use_special_block=True)
+#     # save dataset to file for reuse (overwrites current dataset file)
+#     out_path = Path(dataset_path).with_suffix('.bpt.npz')
+#     np.savez_compressed(out_path, dataset.data, allow_pickle=True)
+#     print(f"[encoder_training_main] Saved BPT-augmented dataset to {out_path}")
+
+
+
 loss = autoencoder_trainer.train(30,stop_at_loss = 0.2, diplay_graph= True)
 
 autoencoder_trainer.save(f'{"./Model"}/mesh-encoder_16k_4_2.pt')

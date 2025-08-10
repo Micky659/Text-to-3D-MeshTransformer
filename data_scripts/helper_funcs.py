@@ -345,26 +345,63 @@ def derive_face_edges_from_faces(
 # custom collater
 
 def custom_collate(data, pad_id=-1):
+    # is_dict = isinstance(first(data), dict)
+    #
+    # if is_dict:
+    #     keys = first(data).keys()
+    #     data = [d.values() for d in data]
+    #
+    # output = []
+    #
+    # for datum in zip(*data):
+    #     if is_tensor(first(datum)):
+    #         datum = pad_sequence(datum, batch_first=True, padding_value=pad_id)
+    #     else:
+    #         datum = list(datum)
+    #         output.append(datum)
+    #
+    #     output.append(datum)
+    #
+    # output = tuple(output)
+    #
+    # if is_dict:
+    #     output = dict(zip(keys, output))
+    #
+    # return output
+
+    """
+    Robust collate function:
+      - Pads tensor fields with pad_sequence if they have variable length along dim=0.
+      - Stacks tensor fields if they already have consistent shapes.
+      - Keeps non-tensor fields as Python lists (e.g., strings, uids).
+    Expects `data` to be a list of dicts or a list of tuples/lists consistent with Dataset.__getitem__.
+    """
     is_dict = isinstance(first(data), dict)
 
     if is_dict:
-        keys = first(data).keys()
-        data = [d.values() for d in data]
+        keys = list(first(data).keys())
+        # turn list of dicts -> list of lists (values)
+        data = [list(d.values()) for d in data]
 
-    output = []
+    # transpose: fields are grouped across the batch
+    transposed = list(zip(*data))
+    output_fields = []
 
-    for datum in zip(*data):
-        if is_tensor(first(datum)):
-            datum = pad_sequence(datum, batch_first=True, padding_value=pad_id)
+    for field_values in transposed:
+        first_val = field_values[0]
+        if is_tensor(first_val):
+            # try padding variable-length tensors (common case for sequences)
+            try:
+                padded = pad_sequence(field_values, batch_first=True, padding_value=pad_id)
+            except Exception:
+                # if pad_sequence fails (all same shape), stack
+                padded = torch.stack(field_values, dim=0)
+            output_fields.append(padded)
         else:
-            datum = list(datum)
-            output.append(datum)
-
-        output.append(datum)
-
-    output = tuple(output)
+            # keep raw python objects in a list
+            output_fields.append(list(field_values))
 
     if is_dict:
-        output = dict(zip(keys, output))
+        return dict(zip(keys, output_fields))
+    return tuple(output_fields)
 
-    return output
