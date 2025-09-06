@@ -518,6 +518,12 @@ class MeshAutoencoder(Module):
             face_mask: Bool['b n'] | None = None,
             return_discrete_codes=False
     ):
+
+        device = next(self.parameters()).device
+        if not isinstance(codes, torch.Tensor):
+            codes = torch.as_tensor(codes)
+        codes = codes.to(device)
+
         codes = rearrange(codes, 'b ... -> b (...)')
 
         if not exists(face_mask):

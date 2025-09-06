@@ -70,12 +70,19 @@ class MeshDataset(Dataset):
         loaded_data = np.load(path, allow_pickle=True)
         data = []
         for item in loaded_data["arr_0"]:
+            # # Convert each tensor in item to CPU if it's CUDA-bound
+            # clean_item = {}
+            # for k, v in item.items():
+            #     if isinstance(v, torch.Tensor) and v.device.type == 'cuda':
+            #         clean_item[k] = v.cpu()
+            #     else:
+            #         clean_item[k] = v
             data.append(item)
         print(f"[MeshDataset] Loaded {len(data)} entries")
         return cls(data)
 
     def sort_dataset_keys(self):
-        desired_order = ['vertices', 'faces', 'face_edges', 'texts', 'text_embeds', 'codes']
+        desired_order = ['vertices', 'faces', 'face_edges', 'texts', 'text_embeds', 'codes', 'bpt_codes']
         self.data = [
             {key: d[key] for key in desired_order if key in d} for d in self.data
         ]
@@ -159,8 +166,9 @@ class MeshDataset(Dataset):
 
 
     def generate_codes_bpt(self, batch_size: int = 25, pad_id: int = -1,
-                           block_size: int = 8, offset_size: int = 16,
-                           use_special_block: bool = True):
+                           block_size: int = 16, offset_size: int = 16,
+                           use_special_block: bool = False,
+                           store_field: str = "bpt_codes"):
         """
         Generate BPT codes for each sample and store them under item['codes'].
         This is CPU-side and operates on per-item meshes (trimesh).
@@ -176,7 +184,7 @@ class MeshDataset(Dataset):
                 faces = item.get('faces', None)
                 if verts is None or faces is None:
                     # skip malformed entry
-                    item['codes'] = torch.tensor([], dtype=torch.long)
+                    item[store_field] = torch.tensor([], dtype=torch.long)
                     continue
 
                 if isinstance(verts, torch.Tensor):
@@ -191,7 +199,7 @@ class MeshDataset(Dataset):
 
                 # remove any padded faces (negative indices or indices >= num verts)
                 if faces_np.size == 0:
-                    item['codes'] = torch.tensor([], dtype=torch.long)
+                    item[store_field] = torch.tensor([], dtype=torch.long)
                     continue
 
                 # Only keep rows that are valid (all indices in range)
@@ -199,25 +207,25 @@ class MeshDataset(Dataset):
                 faces_clean = faces_np[valid_mask]
 
                 if faces_clean.size == 0:
-                    item['codes'] = torch.tensor([], dtype=torch.long)
+                    item[store_field] = torch.tensor([], dtype=torch.long)
                     continue
 
                 # construct trimesh and call BPT serialize
                 try:
                     mesh = trimesh.Trimesh(vertices=verts_np, faces=faces_clean, process=False)
-                    codes = BPT_serialize(mesh)  # returns numpy array of int codes
+                    codes = BPT_serialize(mesh, block_size, offset_size, use_special_block)  # returns numpy array of int codes
                 except Exception as e:
                     # on failure produce empty tensor and continue
                     print(f"[generate_codes_bpt] failed for item idx with error: {e}")
-                    item['codes'] = torch.tensor([], dtype=torch.long)
+                    item[store_field] = torch.tensor([], dtype=torch.long)
                     continue
 
                 # store as torch.LongTensor for downstream collate/padding
                 if isinstance(codes, np.ndarray):
-                    item['codes'] = torch.from_numpy(codes.astype(np.int64)).long()
+                    item[store_field] = torch.from_numpy(codes.astype(np.int64)).long()
                 else:
                     # if BPT returns list
-                    item['codes'] = torch.tensor(codes, dtype=torch.long)
+                    item[store_field] = torch.tensor(codes, dtype=torch.long)
 
         self.sort_dataset_keys()
         print(f"[MeshDataset] Generated BPT codes for {len(self.data)} entries (pad_id={pad_id})")

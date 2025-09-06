@@ -39,7 +39,7 @@ class MeshTransformerTrainer(Module):
             num_train_steps: int,
             batch_size: int,
             grad_accum_every: int,
-            learning_rate: float = 2e-4,
+            learning_rate: float = 1e-4,
             weight_decay: float = 0.,
             max_grad_norm: float | None = 0.5,
             val_dataset: Dataset | None = None,
@@ -259,15 +259,16 @@ class MeshTransformerTrainer(Module):
         self.print('training complete')
 
 
-    def train(self, num_epochs, stop_at_loss = None, diplay_graph = False):
+    def train(self, num_epochs, stop_at_loss = None, diplay_graph = False, start_epoch=0):
         epoch_losses = []
         epoch_size = len(self.dataloader)
         self.model.train()
 
         for epoch in range(num_epochs):
+            new_epoch = start_epoch + epoch
             total_epoch_loss = 0.0
 
-            progress_bar = tqdm(enumerate(self.dataloader), desc=f'Epoch {epoch + 1}/{num_epochs}', total=len(self.dataloader))
+            progress_bar = tqdm(enumerate(self.dataloader), desc=f'Epoch {new_epoch + 1}/{start_epoch + num_epochs}', total=len(self.dataloader))
             for batch_idx, batch in progress_bar:
 
                 is_last = (batch_idx +1) % self.grad_accum_every == 0
@@ -287,7 +288,7 @@ class MeshTransformerTrainer(Module):
                     self.optimizer.zero_grad()
 
             avg_epoch_loss = total_epoch_loss / epoch_size
-            epochOut = f'Epoch {epoch + 1} average loss: {avg_epoch_loss}'
+            epochOut = f'Epoch {new_epoch + 1} average loss: {avg_epoch_loss}'
 
 
             epoch_losses.append(avg_epoch_loss)
@@ -304,12 +305,12 @@ class MeshTransformerTrainer(Module):
             self.print(epochOut)
 
             if self.is_main and self.checkpoint_every_epoch is not None and \
-                    (self.checkpoint_every_epoch == 1 or (epoch != 0 and epoch % self.checkpoint_every_epoch == 0)):
+                    (self.checkpoint_every_epoch == 1 or (new_epoch != 0 and new_epoch % self.checkpoint_every_epoch == 0)):
                 self.save(
-                    self.checkpoint_folder / f'mesh-transformer.ckpt.epoch_{epoch}_avg_loss_{avg_epoch_loss:.3f}.pt')
+                    self.checkpoint_folder / f'mesh-transformer.ckpt.epoch_{new_epoch}_avg_loss_{avg_epoch_loss:.3f}.pt')
 
             if stop_at_loss is not None and avg_epoch_loss < stop_at_loss:
-                self.print(f'Stopping training at epoch {epoch} with average loss {avg_epoch_loss}')
+                self.print(f'Stopping training at epoch {new_epoch} with average loss {avg_epoch_loss}')
                 if self.is_main and self.checkpoint_every_epoch is not None:
                     self.save(
                         self.checkpoint_folder / f'mesh-transformer.ckpt.stop_at_loss_avg_loss_{avg_epoch_loss:.3f}.pt')

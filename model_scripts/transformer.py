@@ -28,6 +28,9 @@ from gateloop_transformer import SimpleGateLoopLayer
 
 from tqdm import tqdm
 
+from data_scripts.BPT import BPT_deserialize
+import numpy as np
+
 from data_scripts.helper_funcs import *
 from model_scripts.resnet import FiLM
 from data_scripts.typing_mod import Int
@@ -129,6 +132,12 @@ class MeshTransformer(Module, PyTorchModelHubMixin):
         self.num_quantizers = autoencoder.num_quantizers
 
         self.eos_token_id = self.codebook_size
+
+        # self.use_bpt = False
+        # self.bpt_block_size = 16
+        # self.bpt_offset_size = 16
+        # self.bpt_use_special_block = False
+        #
 
         # the fine transformer sos token
         # as well as a projection of pooled text embeddings to condition it
@@ -411,6 +420,32 @@ class MeshTransformer(Module, PyTorchModelHubMixin):
         if return_codes:
             codes = rearrange(codes, 'b (n q) -> b n q', q=self.num_quantizers)
             return codes
+
+        # # If we are using BPT tokens (i.e. model.bpt_vocab_size is configured and dataset codes are BPT),
+        # # decode with BPT_deserialize. Otherwise fall back to autoencoder decode_from_codes_to_faces.
+        # if self.use_bpt:
+        #     # codes: (B, L) where each element is a raw BPT token id (padded with self.pad_id)
+        #     vertices_list = []
+        #     codes_np = codes.detach().cpu().numpy()
+        #     for i in range(codes_np.shape[0]):
+        #         row = codes_np[i]
+        #         # remove pad values (if padded with self.pad_id)
+        #         if self.pad_id is not None:
+        #             row = row[row != self.pad_id]
+        #         # if no tokens left return empty array
+        #         if row.size == 0:
+        #             vertices_list.append(np.zeros((0, 3)))
+        #             continue
+        #         try:
+        #             verts = BPT_deserialize(row, block_size=getattr(self, "bpt_block_size", 16),
+        #                                     offset_size=getattr(self, "bpt_offset_size", 16),
+        #                                     compressed=True,
+        #                                     use_special_block=getattr(self, "bpt_use_special_block", False))
+        #         except Exception:
+        #             verts = np.zeros((0, 3))
+        #         vertices_list.append(verts)
+        #     return vertices_list
+
 
         self.autoencoder.eval()
         face_coords, face_mask = self.autoencoder.decode_from_codes_to_faces(codes)

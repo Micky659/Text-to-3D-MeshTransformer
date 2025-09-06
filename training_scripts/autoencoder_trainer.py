@@ -98,6 +98,9 @@ class MeshAutoencoderTrainer(Module):
             shuffle = True,
             batch_size = batch_size,
             drop_last = True,
+            # pin_memory=True,
+            # num_workers=4,
+            # persistent_workers=True,
             collate_fn = partial(custom_collate, pad_id = model.pad_id)
         )
 

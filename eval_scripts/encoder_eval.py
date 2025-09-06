@@ -14,7 +14,7 @@ project_root = script_dir.parent
 
 working_dir = project_root / "Data"
 working_dir.mkdir(exist_ok=True, parents=True)
-dataset_path = "Data/meshData_7_1024.npz"
+dataset_path =  working_dir / "meshData_org.npz"
 dataset = MeshDataset.load(dataset_path)
 
 autoencoder = MeshAutoencoder(
@@ -38,9 +38,9 @@ print(f"Total parameters: {total_params}")
 batch_size=16 # The batch size should be max 64.
 grad_accum_every = 4
 # So set the maximal batch size (max 64) that your VRAM can handle and then use grad_accum_every to create a effective batch size of 64, e.g  16 * 4 = 64
-learning_rate = 1e-4 # Start with 1e-3 then at staggnation around 0.35, you can lower it to 1e-4.
+learning_rate = 1e-3 # Start with 1e-3 then at staggnation around 0.35, you can lower it to 1e-4.
 
-autoencoder.commit_loss_weight = 0.2 # Set dependant on the dataset size, on smaller datasets, 0.1 is fine, otherwise try from 0.25 to 0.4.
+autoencoder.commit_loss_weight = 0.4 # Set dependant on the dataset size, on smaller datasets, 0.1 is fine, otherwise try from 0.25 to 0.4.
 autoencoder_trainer = MeshAutoencoderTrainer(model =autoencoder ,warmup_steps = 10, dataset = dataset, num_train_steps=100,
                                              batch_size=batch_size,
                                              grad_accum_every = grad_accum_every,
@@ -49,22 +49,24 @@ autoencoder_trainer = MeshAutoencoderTrainer(model =autoencoder ,warmup_steps = 
                                              checkpoint_folder = './checkpoints')
 
 # find last epoch checkpoint
-trainer_ckpt_dir = Path("./checkpoints")
+trainer_ckpt_dir = Path(project_root / "checkpoints")
 ckpts = sorted(trainer_ckpt_dir.glob("mesh-autoencoder.ckpt.epoch_*.pt"))
 if not ckpts:
     raise RuntimeError("No checkpoint to resume from.")
 def _epoch_from_name(p):
     m = re.search(r'epoch_(\d+)_', p.name)
     return int(m.group(1)) if m else -1
-# last_ckpt = max(ckpts, key=_epoch_from_name)
-last_ckpt = "checkpoints/mesh-autoencoder.ckpt.epoch_96_avg_loss_0.43177_recon_0.3578_commit_0.3698.pt"
-
+last_ckpt = max(ckpts, key=_epoch_from_name)
+print(last_ckpt)
+# last_ckpt = "checkpoints/mesh-autoencoder.ckpt.epoch_96_avg_loss_0.43177_recon_0.3578_commit_0.3698.pt"
+saved_model = Path(project_root / "Model" / 'mesh-encoder_16k_4_2.pt')
+print(saved_model, Path(f'{project_root}/{"Model"}/mesh-encoder_16k_4_2.pt'), Path(f'{project_root}/{"Model"}/mesh-encoder_16k_4_2.pt').exists())
 # load state
-autoencoder_trainer.load(last_ckpt)
+autoencoder_trainer.load(saved_model)
 
-# change lr AFTER load
-for pg in autoencoder_trainer.optimizer.optimizer.param_groups:
-    pg["lr"] = learning_rate
+# # change lr AFTER load
+# for pg in autoencoder_trainer.optimizer.optimizer.param_groups:
+#     pg["lr"] = learning_rate
 
 
 min_mse, max_mse = float('inf'), float('-inf')
@@ -97,4 +99,4 @@ for item in tqdm(dataset.data[:sample_size]):
         random_samples, random_samples_pred = [], []
 
 print(f'MSE AVG: {total_mse / sample_size:.10f}, Min: {min_mse:.10f}, Max: {max_mse:.10f}')
-mesh_render.combind_mesh_with_rows(f'{"./Data"}/mse_rows.obj', all_random_samples)
+mesh_render.combind_mesh_with_rows(project_root/'Data'/'mse_rows.obj', all_random_samples)

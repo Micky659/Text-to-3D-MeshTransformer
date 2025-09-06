@@ -174,7 +174,7 @@ def get_block_representation(
     return sequence.flatten()
 
 
-def BPT_serialize(mesh: trimesh.Trimesh):
+def BPT_serialize(mesh: trimesh.Trimesh, block_size, offset_size, use_special_block):
     # serialize mesh with BPT
 
     # 1. patchify faces into patches
@@ -182,8 +182,8 @@ def BPT_serialize(mesh: trimesh.Trimesh):
 
     # 2. convert coordinates to block-wise indexes
     codes = get_block_representation(
-        sequence, block_size=8, offset_size=16,
-        block_compressed=True, special_token=-2, use_special_block=True
+        sequence, block_size=block_size, offset_size=offset_size,
+        block_compressed=True, special_token=-2, use_special_block=use_special_block
     )
     return codes
 
