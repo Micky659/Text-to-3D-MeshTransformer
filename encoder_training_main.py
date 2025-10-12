@@ -32,7 +32,9 @@ def main():
         dim_angle_embed=8,
 
         attn_decoder_depth=4,
-        attn_encoder_depth=2
+        attn_encoder_depth=2,
+
+        use_residual_lfq=True # If true uses residual lfq otherwise residual rq
     ).to("cuda")
     total_params = sum(p.numel() for p in autoencoder.parameters())
     total_params = f"{total_params / 1000000:.1f}M"
