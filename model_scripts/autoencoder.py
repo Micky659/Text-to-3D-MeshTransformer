@@ -23,7 +23,8 @@ from local_attention import LocalMHA
 
 from vector_quantize_pytorch import (
     ResidualVQ,
-    ResidualLFQ
+    ResidualLFQ,
+    ResidualSimVQ
 )
 
 from taylor_series_linear_attention import TaylorSeriesLinearAttn
@@ -63,6 +64,7 @@ class MeshAutoencoder(Module):
             num_quantizers=2,  # or 'D' in the paper
             codebook_size=16384,  # they use 16k, shared codebook between layers
             use_residual_lfq=True,  # whether to use the latest lookup-free quantization
+            use_residual_simvq=False,
             rq_kwargs: dict = dict(
                 quantize_dropout=True,
                 quantize_dropout_cutoff_index=1,
@@ -188,7 +190,15 @@ class MeshAutoencoder(Module):
 
         self.project_dim_codebook = nn.Linear(curr_dim, dim_codebook * self.num_vertices_per_face)
 
-        if use_residual_lfq:
+        if use_residual_simvq:
+            self.quantizer = ResidualSimVQ(
+                dim=dim_codebook,
+                num_quantizers=num_quantizers,
+                codebook_size=codebook_size,
+                commitment_weight=1.,
+                **rq_kwargs
+            )
+        elif use_residual_lfq:
             self.quantizer = ResidualLFQ(
                 dim=dim_codebook,
                 num_quantizers=num_quantizers,
@@ -443,9 +453,12 @@ class MeshAutoencoder(Module):
         mask = torch.ones((batch, num_vertices + 1), device=device, dtype=torch.bool)
         mask[:, -1] = False
 
-        # rvq specific kwargs
+        # quantizer specific kwargs - ResidualSimVQ doesn't support mask argument
 
-        quantize_kwargs = dict(mask=mask)
+        quantize_kwargs = dict()
+
+        if not isinstance(self.quantizer, ResidualSimVQ):
+            quantize_kwargs.update(mask=mask)
 
         if isinstance(self.quantizer, ResidualVQ):
             quantize_kwargs.update(sample_codebook_temp=rvq_sample_codebook_temp)
@@ -455,6 +468,20 @@ class MeshAutoencoder(Module):
         def quantize_wrapper_fn(inp):
             unquantized, quantize_kwargs = inp
             return self.quantizer(unquantized, **quantize_kwargs)
+
+        # maybe checkpoint the quantize fn
+
+        if self.checkpoint_quantizer:
+            quantize_wrapper_fn = partial(checkpoint, quantize_wrapper_fn, use_reentrant=False)
+
+        # residual VQ
+
+        quantized, codes, commit_loss = quantize_wrapper_fn((averaged_vertices, quantize_kwargs))
+
+        # For ResidualSimVQ, manually apply masking to outputs
+        if isinstance(self.quantizer, ResidualSimVQ):
+            quantized = quantized * mask.unsqueeze(-1)
+            codes = codes * mask.unsqueeze(-1).long()
 
         # maybe checkpoint the quantize fn
 

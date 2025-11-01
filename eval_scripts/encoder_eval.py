@@ -14,7 +14,8 @@ project_root = script_dir.parent
 
 working_dir = project_root / "Data"
 working_dir.mkdir(exist_ok=True, parents=True)
-dataset_path =  working_dir / "meshData_org.npz"
+# dataset_path =  working_dir / "meshData_org_augmented.npz"
+dataset_path =  working_dir / "meshData_augmented_2.npz"
 dataset = MeshDataset.load(dataset_path)
 
 autoencoder = MeshAutoencoder(
@@ -28,7 +29,8 @@ autoencoder = MeshAutoencoder(
     dim_angle_embed=8,
 
     attn_decoder_depth=4,
-    attn_encoder_depth=2
+    attn_encoder_depth=2,
+    use_residual_lfq=False
 ).to("cuda")
 total_params = sum(p.numel() for p in autoencoder.parameters())
 total_params = f"{total_params / 1000000:.1f}M"
@@ -59,7 +61,7 @@ def _epoch_from_name(p):
 last_ckpt = max(ckpts, key=_epoch_from_name)
 print(last_ckpt)
 # last_ckpt = "checkpoints/mesh-autoencoder.ckpt.epoch_96_avg_loss_0.43177_recon_0.3578_commit_0.3698.pt"
-saved_model = Path(project_root / "Model" / 'mesh-encoder_16k_4_2.pt')
+saved_model = Path(project_root / "checkpoints_chairs_rq" / 'mesh-autoencoder.ckpt.epoch_50_avg_loss_1.26883_recon_1.2484_commit_0.2045.pt')
 print(saved_model, Path(f'{project_root}/{"Model"}/mesh-encoder_16k_4_2.pt'), Path(f'{project_root}/{"Model"}/mesh-encoder_16k_4_2.pt').exists())
 # load state
 autoencoder_trainer.load(saved_model)
@@ -68,13 +70,15 @@ autoencoder_trainer.load(saved_model)
 # for pg in autoencoder_trainer.optimizer.optimizer.param_groups:
 #     pg["lr"] = learning_rate
 
-
+autoencoder_trainer.load(saved_model)
 min_mse, max_mse = float('inf'), float('-inf')
 min_coords, min_orgs, max_coords, max_orgs = None, None, None, None
 random_samples, random_samples_pred, all_random_samples = [], [], []
-total_mse, sample_size = 0.0, 200
+total_mse, sample_size = 0.0, 500
 
 random.shuffle(dataset.data)
+from collections import defaultdict
+uni = defaultdict(int)
 
 for item in tqdm(dataset.data[:sample_size]):
     codes = autoencoder.tokenize(vertices=item['vertices'], faces=item['faces'], face_edges=item['face_edges'])
@@ -86,6 +90,7 @@ for item in tqdm(dataset.data[:sample_size]):
     orgs = item['vertices'][item['faces']].unsqueeze(0)
 
     mse = torch.mean((orgs.view(-1, 3).cpu() - coords.view(-1, 3).cpu()) ** 2)
+    uni[item['texts']] += mse
     total_mse += mse
 
     if mse < min_mse: min_mse, min_coords, min_orgs = mse, coords, orgs
@@ -97,6 +102,6 @@ for item in tqdm(dataset.data[:sample_size]):
     else:
         all_random_samples.extend([random_samples_pred, random_samples])
         random_samples, random_samples_pred = [], []
-
+print(uni)
 print(f'MSE AVG: {total_mse / sample_size:.10f}, Min: {min_mse:.10f}, Max: {max_mse:.10f}')
 mesh_render.combind_mesh_with_rows(project_root/'Data'/'mse_rows.obj', all_random_samples)

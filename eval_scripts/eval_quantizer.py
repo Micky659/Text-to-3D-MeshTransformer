@@ -21,14 +21,10 @@ import torch
 from tqdm import tqdm
 
 # Try to import project classes - adjust these imports to match your codebase
-try:
-    from meshgpt_pytorch import MeshAutoencoder, MeshAutoencoderTrainer, MeshDataset, mesh_render
-except Exception:
-    # fallback import names used in your earlier snippets
-    from data_scripts.Mesh_dataset import MeshDataset
-    from model_scripts.autoencoder import MeshAutoencoder
-    from model_scripts.trainers import MeshAutoencoderTrainer
-    import data_scripts.mesh_render as mesh_render
+from data_scripts.Mesh_dataset import MeshDataset
+from model_scripts.autoencoder import MeshAutoencoder
+from training_scripts.autoencoder_trainer import MeshAutoencoderTrainer
+import data_scripts.mesh_render as mesh_render
 
 # Chamfer utilities: prefer pytorch3d if available; else use scipy KDTree
 USE_PYTORCH3D = False

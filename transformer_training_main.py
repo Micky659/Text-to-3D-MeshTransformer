@@ -8,7 +8,7 @@ from training_scripts.transformer_trainer import MeshTransformerTrainer
 
 
 script_dir = Path(__file__).resolve().parent
-DATASET_PATH = "Data/meshData_org.npz"
+DATASET_PATH = "Data/meshData_augmented_2.npz"
 
 dataset = MeshDataset.load(DATASET_PATH)
 # ds.data = ds.data[:400]
@@ -64,7 +64,7 @@ def filter_dataset_by_categories(dataset, categories_to_ft):
 
 # Example:
 categories_to_ft = ['ashcan trash can garbage can wastebin ash bin ash-bin ashbin dustbin trash barrel trash bin', 'bag traveling bag travelling bag grip suitcase', 'bed', 'bench', 'bookshelf', 'bus autobus coach charabanc double-decker jitney motorbus motorcoach omnibus passenger vehi', 'cabinet', 'car auto automobile machine motorcar', 'chair', 'lamp', 'mailbox letter box', 'motorcycle bike', 'pot flowerpot', 'sofa couch lounge', 'table']
-ft_dataset = filter_dataset_by_categories(dataset, categories_to_ft)
+# ft_dataset = filter_dataset_by_categories(dataset, categories_to_ft)
 
 trainer_ckpt_dir = Path("./checkpoints")
 ckpts = sorted(trainer_ckpt_dir.glob("mesh-transformer.ckpt.epoch_*.pt"))
@@ -78,14 +78,14 @@ def _epoch_from_name(p):
 last_ckpt = max(ckpts, key=_epoch_from_name)
 resume_epoch = _epoch_from_name(last_ckpt) + 1
 
-pkg = torch.load(str(last_ckpt))
-transformer.load_state_dict(pkg['model'])
+# pkg = torch.load(str(last_ckpt))
+# transformer.load_state_dict(pkg['model'])
 
 
-labels = list(set(item["texts"] for item in ft_dataset.data))
-ft_dataset.embed_texts(transformer, batch_size = 25)
-ft_dataset.generate_codes(autoencoder, batch_size = 50)
-print(ft_dataset.data[0].keys())
+labels = list(set(item["texts"] for item in dataset.data))
+dataset.embed_texts(transformer, batch_size = 25)
+dataset.generate_codes(autoencoder, batch_size = 50)
+print(dataset.data[0].keys())
 print(labels)
 
 # pkg = torch.load(str(f'{working_dir}\mesh-transformer_{project_name}.pt'))
@@ -96,26 +96,27 @@ batch_size = 4 # Max 64
 grad_accum_every = 16
 
 # Set the maximal batch size (max 64) that your VRAM can handle and then use grad_accum_every to create a effective batch size of 64, e.g  4 * 16 = 64
-learning_rate = 1e-4 # Start training with the learning rate at 1e-2 then lower it to 1e-3 at stagnation or at 0.5 loss.
+learning_rate = 1e-3 # Start training with the learning rate at 1e-2 then lower it to 1e-3 at stagnation or at 0.5 loss.
 
-trainer = MeshTransformerTrainer(model = transformer,warmup_steps = 10,num_train_steps=100, dataset = ft_dataset,
+trainer = MeshTransformerTrainer(model = transformer,warmup_steps = 1000,num_train_steps=100, dataset = dataset,
                                  grad_accum_every=grad_accum_every,
                                  learning_rate = learning_rate,
                                  batch_size=batch_size,
-                                 checkpoint_every_epoch = 10,
+                                 checkpoint_every_epoch = 5,
                                  # FP16 training, it doesn't speed up very much but can increase the batch size which will in turn speed up the training.
                                  # However it might cause nan after a while.
                                  # accelerator_kwargs = {"mixed_precision" : "fp16"}, optimizer_kwargs = { "eps": 1e-7}
                                  )
 
-# trainer.load(last_ckpt)
-#
-# for pg in trainer.optimizer.optimizer.param_groups:
-#     print(pg["lr"])
-#     pg["lr"] = learning_rate
-#     print(pg["lr"])
+trainer.load(last_ckpt)
 
-loss = trainer.train(50, stop_at_loss = 0.001, diplay_graph=True, start_epoch=resume_epoch)
+for pg in trainer.optimizer.optimizer.param_groups:
+    print(pg["lr"])
+    pg["lr"] = learning_rate
+    print(pg["lr"])
 
-trainer.save(f'{"Model"}/mesh-transformer_16k_4_2_finetuned.pt')
+# loss = trainer.train(50, stop_at_loss = 0.005, diplay_graph=True)
+loss = trainer.train(100, stop_at_loss = 0.0001, diplay_graph=True, start_epoch = resume_epoch)
+
+trainer.save(f'{"Model"}/mesh-transformer_768_{max_seq}_augment_3.pt')
 
