@@ -83,6 +83,8 @@ print(f"Decoder total parameters: {total_params}")
 pkg = torch.load(str(project_root/"Model"/"mesh-transformer_16k_4_2.pt"))
 transformer.load_state_dict(pkg['model'])
 
+mesh_output = transformer.generate(texts=[cat], temperature=0.0)
+
 folder = project_root/'Data'/'renders'
 obj_file_path = Path(folder)
 obj_file_path.mkdir(exist_ok=True, parents=True)

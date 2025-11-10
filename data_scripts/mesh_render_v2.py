@@ -70,6 +70,84 @@ def extract_vertices_from_mesh(mesh_output):
     else:
         return np.array([]).reshape(0, 3)
 
+import numpy as np
+
+def get_angle(v1, v2, v3):
+    """Compute the angle between two triangle edges (for face orientation heuristic)."""
+    a = v2 - v1
+    b = v3 - v1
+    cos_angle = np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8)
+    return np.degrees(np.arccos(np.clip(cos_angle, -1.0, 1.0)))
+
+
+def extract_vertices_faces_from_mesh(mesh_output):
+    """
+    Extract vertices and compute oriented faces from a mesh tensor/mask format.
+
+    Returns:
+        vertices: np.ndarray of shape (N, 3)
+        faces: np.ndarray of shape (N/3, 3)
+    """
+    all_vertices = []
+    all_faces = []
+
+    mesh_list = mesh_output if isinstance(mesh_output, list) else [mesh_output]
+
+    for mesh_item in mesh_list:
+        tensor, mask = mesh_item
+        for tensor_batch, mask_batch in zip(tensor, mask):
+            vertices = tensor_batch[mask_batch].cpu().numpy().reshape(-1, 3)
+            all_vertices.append(vertices)
+
+    if not all_vertices:
+        return np.array([]).reshape(0, 3), np.array([]).reshape(0, 3)
+
+    vertices = np.vstack(all_vertices)
+    num_vertices = len(vertices)
+    if num_vertices % 3 != 0:
+        print(f"⚠️ Warning: vertex count {num_vertices} not multiple of 3 — trimming extras.")
+        num_faces = num_vertices // 3
+        vertices = vertices[:num_faces * 3]
+    else:
+        num_faces = num_vertices // 3
+
+    # Calculate mesh center for face orientation
+    mesh_center = np.mean(vertices, axis=0)
+
+    # Compute faces using the same logic you provided
+    for i in range(0, len(vertices), 3):
+        v1, v2, v3 = vertices[i], vertices[i + 1], vertices[i + 2]
+
+        normal = np.cross(v2 - v1, v3 - v1)
+
+        # Determine direction for face orientation
+        if get_angle(v1, v2, v3) > 60:
+            direction_vector = mesh_center - np.mean([v1, v2, v3], axis=0)
+            direction_vector = -direction_vector
+        else:
+            direction_vector = np.array([0, 1, 0])
+
+        # Reorder vertices if needed
+        if np.dot(normal, direction_vector) > 0:
+            order = [0, 1, 2]
+        else:
+            order = [0, 2, 1]
+
+        reordered_vertices = [v1, v2, v3][order[0]], [v1, v2, v3][order[1]], [v1, v2, v3][order[2]]
+
+        # Find indices of reordered vertices in the global vertex array
+        indices = [
+            np.where((vertices == vertex).all(axis=1))[0][0]
+            for vertex in reordered_vertices
+        ]
+
+        all_faces.append(indices)
+
+    faces = np.array(all_faces, dtype=np.int32)
+
+    return vertices, faces
+
+
 
 def scale_mesh_to_target(vertices, target_bbox):
     """
@@ -248,6 +326,22 @@ def compute_mesh_metadata(vertices):
         "num_faces": num_faces
     }
 
+def extract_cleaned_vertices_from_mesh(mesh_output):
+    all_vertices = []
+
+    mesh_list = mesh_output if isinstance(mesh_output, list) else [mesh_output]
+
+    for mesh_item in mesh_list:
+        tensor, mask = mesh_item
+
+        for tensor_batch, mask_batch in zip(tensor, mask):
+            vertices = tensor_batch[mask_batch].cpu().numpy().reshape(-1, 3)
+            all_vertices.append(vertices)
+
+    if all_vertices:
+        return np.vstack(all_vertices)
+    else:
+        return np.array([]).reshape(0, 3)
 
 # Example usage in your pipeline:
 """
