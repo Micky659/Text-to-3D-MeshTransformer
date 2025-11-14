@@ -13,7 +13,7 @@ from model_scripts.transformer import MeshTransformer
 import sys
 
 sys.path.append(str(Path(__file__).parent))
-from data_scripts.mesh_render_v2 import extract_vertices_from_mesh
+from data_scripts.mesh_render_v2 import extract_vertices_faces_from_mesh
 
 
 script_dir = Path(__file__).resolve().parent
@@ -66,7 +66,7 @@ autoencoder = MeshAutoencoder(
 ).to("cuda")
 
 # Load autoencoder weights
-pkg = torch.load(str(project_root / "Model" / "mesh-encoder_16k_4_2.pt"))
+pkg = torch.load(str(project_root / "Models" / "mesh-encoder_16k_4_2.pt"))
 autoencoder.load_state_dict(pkg['model'])
 print("Autoencoder loaded")
 
@@ -95,7 +95,7 @@ total_params = sum(p.numel() for p in transformer.decoder.parameters())
 print(f"Decoder total parameters: {total_params / 1000000:.1f}M")
 
 # Load transformer weights
-pkg = torch.load(str(project_root / "Model" / "mesh-transformer_16k_4_2.pt"))
+pkg = torch.load(str(project_root / "Models" / "mesh-transformer_16k_4_2.pt"))
 transformer.load_state_dict(pkg['model'])
 print("Transformer loaded")
 
@@ -105,21 +105,59 @@ autoencoder.eval()
 output_dir = Path("mesh_samples")
 output_dir.mkdir(parents=True, exist_ok=True)
 
-categories = ['chair']
+# categories = ['chair']
+
+# ['printer printing machine', 'bench', 'pistol handgun side arm shooting iron', 'earphone earpiece headphone phone',
+# 'table', 'dishwasher dish washer dishwashing machine', 'knife', 'pillow', 'helmet', 'bed', 'microwave microwave oven',
+# 'basket handbasket', 'mug', 'faucet spigot', 'pot flowerpot', 'rocket projectile', 'piano pianoforte forte-piano',
+# 'cellular telephone cellular phone cellphone cell mobile phone', 'computer keyboard keypad', 'can tin tin can',
+# 'sofa couch lounge', 'chair', 'ashcan trash can garbage can wastebin ash bin ash-bin ashbin dustbin trash barrel trash bin',
+# 'cap', 'tower', 'bus autobus coach charabanc double-decker jitney motorbus motorcoach omnibus passenger vehi',
+# 'skateboard', 'loudspeaker speaker speaker unit loudspeaker system speaker system', 'bag traveling bag travelling bag grip suitcase',
+# 'bookshelf', 'jar', 'mailbox letter box', 'file file cabinet filing cabinet', 'guitar', 'motorcycle bike', 'remote control remote',
+# 'camera photographic camera', 'microphone mike', 'bathtub bathing tub bath tub', 'bottle', 'display video display',
+# 'airplane aeroplane plane', 'bowl', 'telephone phone telephone set', 'birdhouse', 'cabinet', 'clock', 'laptop laptop computer',
+# 'vessel watercraft', 'train railroad train', 'washer automatic washer washing machine', 'car auto automobile machine motorcar',
+# 'lamp', 'stove', 'rifle']
+
+unique_categories = list(set([item['texts'] for item in dataset.data if 'texts' in item]))
+print(unique_categories)
+runs = 50
 temperature = [1.0]
 
-for category in categories:
+for category in unique_categories:
+    print("Generating Category:", category)
 
     category_dir = output_dir / category.replace(' ', '_')
     category_dir.mkdir(parents=True, exist_ok=True)
 
-    for sample_idx in range(5):
+    success = 0
+
+    while success < runs:
         mesh_output = transformer.generate(
             texts=[category],
             temperature=1.0,
         )
 
-        generated_vertices = extract_vertices_from_mesh(mesh_output)
+        generated_vertices, faces = extract_vertices_faces_from_mesh(mesh_output)
+        success += 1
 
-        generated_path = category_dir / f"{category}_{sample_idx}.obj"
+        # Convert to numpy arrays
+        vertices = np.asarray(generated_vertices, dtype=np.float32)
+        faces = np.asarray(faces, dtype=np.int32)
+
+        face_vertices = vertices[faces]  # Shape: (num_faces, 3, 3)
+        v0, v1, v2 = face_vertices[:, 0, :], face_vertices[:, 1, :], face_vertices[:, 2, :]
+
+        edge1, edge2 = v1 - v0, v2 - v0
+        normals = np.cross(edge1, edge2)
+        areas = 0.5 * np.linalg.norm(normals, axis=1)
+
+        zero_area_faces = np.sum(areas < 1e-10)
+        if zero_area_faces > 10:
+            print(f"Zero-area faces detected: {zero_area_faces}")
+            success -= 1
+            continue
+
+        generated_path = category_dir / f"{category}_{success}.obj"
         save_obj_from_vertices(generated_vertices, generated_path)
