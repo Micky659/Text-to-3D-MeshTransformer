@@ -21,6 +21,8 @@ import json
 from tqdm import tqdm
 from typing import List, Dict, Tuple
 import warnings
+import random
+import os
 
 warnings.filterwarnings('ignore')
 
@@ -92,8 +94,8 @@ class EvaluationConfig:
         Computation device.
     """
 
-    N_GENERATED = 1000  # Number of meshes to generate per category
-    N_REFERENCE = 1000  # Number of reference meshes from dataset
+    N_GENERATED = 500  # Number of meshes to generate per category
+    N_REFERENCE = 500  # Number of reference meshes from dataset
     N_VIEWPOINTS = 8  # Number of camera angles for rendering
     IMAGE_SIZE = 256  # Resolution for FID/KID computation
     CD_NUM_SAMPLES = 2048  # Points to sample for Chamfer Distance
@@ -128,7 +130,7 @@ def compute_chamfer_distance(points1: np.ndarray, points2: np.ndarray) -> float:
 
 
 def sample_points_from_mesh(vertices: np.ndarray, faces: np.ndarray,
-                            n_samples: int = None) -> np.ndarray:
+                            global_center, global_scale, is_meshgpt: bool = False) -> np.ndarray:
     """
     Sample points uniformly from mesh surface.
 
@@ -140,8 +142,21 @@ def sample_points_from_mesh(vertices: np.ndarray, faces: np.ndarray,
     Returns:
         points: (n_samples, 3) array of sampled points
     """
-    if n_samples is None:
-        n_samples = EvaluationConfig.CD_NUM_SAMPLES
+    n_samples = EvaluationConfig.CD_NUM_SAMPLES
+
+    # if is_meshgpt:
+    #     # MeshGPT: forward=-Y, up=+X
+    #     # Reference: forward=-Z, up=+Y
+    R = np.array([
+        [0, 0, 1],   # Reference X = MeshGPT Z
+        [1, 0, 0],   # Reference Y = MeshGPT X
+        [0, 1, 0]   # Reference Z = -MeshGPT Y
+    ])
+    vertices = vertices @ R.T
+
+    vertices = (vertices - global_center) / global_scale
+
+    np.random.seed(42)
 
     try:
         mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
@@ -161,7 +176,9 @@ def sample_points_from_mesh(vertices: np.ndarray, faces: np.ndarray,
 # SHAPE QUALITY METRICS (MMD, COV, 1-NNA)
 # ============================================================================
 
-def compute_pairwise_cd_matrix(meshes1: List[Dict], meshes2: List[Dict]) -> np.ndarray:
+def compute_pairwise_cd_matrix(meshes1: List[Dict], meshes2: List[Dict],
+                               meshes1_is_meshgpt: bool = False,
+                               meshes2_is_meshgpt: bool = False) -> np.ndarray:
     """
     Compute pairwise Chamfer Distance matrix between two sets of meshes.
 
@@ -175,18 +192,40 @@ def compute_pairwise_cd_matrix(meshes1: List[Dict], meshes2: List[Dict]) -> np.n
     n1, n2 = len(meshes1), len(meshes2)
     distances = np.zeros((n1, n2))
 
+    all_vertices = []
+
+    for m in meshes1:
+        verts = m['vertices'].copy()
+        if meshes1_is_meshgpt:
+            R = np.array([[0, 0, 1], [1, 0, 0], [0, 1, 0]])
+            verts = verts @ R.T
+        all_vertices.append(verts)
+
+    for m in meshes2:
+        verts = m['vertices'].copy()
+        if meshes2_is_meshgpt:
+            R = np.array([[0, 0, 1], [1, 0, 0], [0, 1, 0]])
+            verts = verts @ R.T
+        all_vertices.append(verts)
+
+    all_vertices = np.concatenate(all_vertices)
+    global_min = all_vertices.min(axis=0)
+    global_max = all_vertices.max(axis=0)
+    global_center = (global_max + global_min) / 2
+    global_scale = np.max(global_max - global_min)
+
     print("Computing pairwise Chamfer Distance matrix...")
     for i in tqdm(range(n1)):
-        points1 = sample_points_from_mesh(meshes1[i]['vertices'], meshes1[i]['faces'])
+        points1 = sample_points_from_mesh(meshes1[i]['vertices'], meshes1[i]['faces'], global_center, global_scale, is_meshgpt=meshes1_is_meshgpt)
 
         for j in range(n2):
-            points2 = sample_points_from_mesh(meshes2[j]['vertices'], meshes2[j]['faces'])
+            points2 = sample_points_from_mesh(meshes2[j]['vertices'], meshes2[j]['faces'], global_center, global_scale, is_meshgpt=meshes2_is_meshgpt)
             distances[i, j] = compute_chamfer_distance(points1, points2)
 
     return distances
 
 
-def compute_mmd(generated_meshes: List[Dict], reference_meshes: List[Dict]) -> float:
+def compute_mmd(dist_matrix, generated_meshes: List[Dict], reference_meshes: List[Dict]) -> float:
     """
     Minimum Matching Distance (MMD)
 
@@ -201,43 +240,80 @@ def compute_mmd(generated_meshes: List[Dict], reference_meshes: List[Dict]) -> f
     - Low MMD: Generated samples are similar to real samples (good)
     - High MMD: Generated samples deviate from real distribution (bad)
     """
-    dist_matrix = compute_pairwise_cd_matrix(generated_meshes, reference_meshes)
-    mmd = np.mean(np.min(dist_matrix, axis=1))
-    return mmd
+    mmd = np.mean(np.min(dist_matrix, axis=1))  # ← axis=0!
+    return mmd * 1000
 
 
-def compute_coverage(generated_meshes: List[Dict], reference_meshes: List[Dict],
-                     threshold: float = None) -> float:
+# def compute_coverage(dist_matrix, generated_meshes: List[Dict], reference_meshes: List[Dict],
+#                      threshold: float = None) -> float:
+#     """
+#     Coverage (COV)
+#
+#     Definition: Percentage of reference samples that are "covered" by generated samples.
+#     A reference sample is covered if at least one generated sample is within threshold distance.
+#
+#     What it measures: Diversity and completeness of the generated distribution.
+#     Higher is better - indicates the model can generate diverse shapes covering the real distribution.
+#
+#     Interpretation:
+#     - High COV (>40%): Model generates diverse shapes covering most of the real distribution (good)
+#     - Low COV (<20%): Model has mode collapse, generating limited variety (bad)
+#
+#     Args:
+#         threshold: Distance threshold for coverage. If None, uses median of pairwise distances.
+#     """
+#
+#     # if threshold is None:
+#     #     # Use median of all pairwise distances as adaptive threshold
+#     #     threshold = np.median(dist_matrix)
+#     #
+#     # # For each reference sample, check if any generated sample is within threshold
+#     # min_distances_to_ref = np.min(dist_matrix, axis=0)
+#     # coverage = np.mean(min_distances_to_ref < 0.01) * 100
+#     #
+#     # return coverage
+#
+#     # For each generated sample, find its nearest reference sample
+#     nn_indices = np.argmin(dist_matrix, axis=1)
+#     # Count how many unique reference meshes were matched
+#     unique_refs = len(np.unique(nn_indices))
+#     cov = (unique_refs / dist_matrix.shape[1]) * 100
+#     return cov
+
+def compute_coverage(dist_matrix, generated_meshes, reference_meshes, threshold=None):
     """
-    Coverage (COV)
+    Coverage: What percentage of reference samples have at least one
+    generated sample as their nearest neighbor?
 
-    Definition: Percentage of reference samples that are "covered" by generated samples.
-    A reference sample is covered if at least one generated sample is within threshold distance.
-
-    What it measures: Diversity and completeness of the generated distribution.
-    Higher is better - indicates the model can generate diverse shapes covering the real distribution.
-
-    Interpretation:
-    - High COV (>40%): Model generates diverse shapes covering most of the real distribution (good)
-    - Low COV (<20%): Model has mode collapse, generating limited variety (bad)
-
-    Args:
-        threshold: Distance threshold for coverage. If None, uses median of pairwise distances.
+    dist_matrix: (n_generated, n_reference)
     """
-    dist_matrix = compute_pairwise_cd_matrix(generated_meshes, reference_meshes)
+    # For each REFERENCE (column), find which GENERATED (row) is closest
+    nearest_gen_to_ref = np.argmin(dist_matrix, axis=0)  # ← axis=0, not axis=1!
+
+    # Count how many unique generated meshes are "covering" references
+    # Actually, we want to count how many references are covered
+    # Paper definition: for each ref, check if ANY gen is close enough
 
     if threshold is None:
         # Use median of all pairwise distances as adaptive threshold
-        threshold = np.median(dist_matrix)
+        # threshold = np.median(dist_matrix)
+        print(np.percentile(dist_matrix, 5))
+        threshold = np.percentile(dist_matrix, 5)
+        # threshold = 0.1
 
-    # For each reference sample, check if any generated sample is within threshold
-    min_distances_to_ref = np.min(dist_matrix, axis=0)
-    coverage = np.mean(min_distances_to_ref < threshold) * 100
+    # For each reference, get minimum distance to any generated mesh
+    min_dist_to_ref = np.min(dist_matrix, axis=0)  # ← axis=0!
 
-    return coverage
+    # Count references that have at least one generated mesh within threshold
+    covered = np.sum(min_dist_to_ref < threshold)
+    cov = (covered / len(reference_meshes)) * 100
+
+    return cov
 
 
-def compute_1nna(generated_meshes: List[Dict], reference_meshes: List[Dict]) -> float:
+def compute_1nna(generated_meshes: List[Dict], reference_meshes: List[Dict],
+                 meshes1_is_meshgpt: bool = False,
+                 meshes2_is_meshgpt: bool = False) -> float:
     """
     1-Nearest Neighbor Accuracy (1-NNA)
 
@@ -264,6 +340,28 @@ def compute_1nna(generated_meshes: List[Dict], reference_meshes: List[Dict]) -> 
     all_meshes = generated_meshes + reference_meshes
     n_total = len(all_meshes)
 
+    all_vertices = []
+
+    for m in generated_meshes:
+        verts = m['vertices'].copy()
+        if meshes1_is_meshgpt:
+            R = np.array([[0, 0, 1], [1, 0, 0], [0, 1, 0]])
+            verts = verts @ R.T
+        all_vertices.append(verts)
+
+    for m in reference_meshes:
+        verts = m['vertices'].copy()
+        if meshes2_is_meshgpt:
+            R = np.array([[0, 0, 1], [1, 0, 0], [0, 1, 0]])
+            verts = verts @ R.T
+        all_vertices.append(verts)
+
+    all_vertices = np.concatenate(all_vertices)
+    global_min = all_vertices.min(axis=0)
+    global_max = all_vertices.max(axis=0)
+    global_center = (global_max + global_min) / 2
+    global_scale = np.max(global_max - global_min)
+
     # Create labels: 0 for generated, 1 for reference
     labels = np.array([0] * n_gen + [1] * n_ref)
 
@@ -271,10 +369,10 @@ def compute_1nna(generated_meshes: List[Dict], reference_meshes: List[Dict]) -> 
     distances = np.zeros((n_total, n_total))
 
     for i in tqdm(range(n_total)):
-        points_i = sample_points_from_mesh(all_meshes[i]['vertices'], all_meshes[i]['faces'])
+        points_i = sample_points_from_mesh(all_meshes[i]['vertices'], all_meshes[i]['faces'], global_center, global_scale)
 
         for j in range(i + 1, n_total):
-            points_j = sample_points_from_mesh(all_meshes[j]['vertices'], all_meshes[j]['faces'])
+            points_j = sample_points_from_mesh(all_meshes[j]['vertices'], all_meshes[j]['faces'], global_center, global_scale)
             dist = compute_chamfer_distance(points_i, points_j)
             distances[i, j] = dist
             distances[j, i] = dist
@@ -585,7 +683,8 @@ def load_meshes_from_obj_files(obj_dir: str, max_meshes: int = None) -> List[Dic
     obj_files = list(Path(obj_dir).glob("*.obj"))
 
     if max_meshes is not None:
-        obj_files = obj_files[:max_meshes]
+        obj_files = random.sample(obj_files, max_meshes)
+        # obj_files = obj_files[:max_meshes]
 
     meshes = []
     print(f"Loading {len(obj_files)} meshes from {obj_dir}...")
@@ -771,11 +870,225 @@ def evaluate_mesh_generation(
 # USAGE EXAMPLE
 # ============================================================================
 
-if __name__ == "__main__":
-    # Example usage
-    results = evaluate_mesh_generation(
-        generated_obj_dir="path/to/generated/meshes",
-        reference_obj_dir="path/to/reference/meshes",
-        output_path="evaluation_results.json",
-        compute_visual_metrics=True  # Set False to skip FID/KID
+def run_comparison_evaluation():
+    generated_obj_dir_ours = "Chair_samples\\Our_chair_samples"
+    generated_obj_dir_meshgpt = "Chair_samples\\MeshGPT_chair_samples"
+    reference_obj_dir = "C:\\Users\\koth_ak\\Akshat's Thesis\\Text-to-3D-MeshTransformer\\Data\\gt_mesh_samples\\chair"
+
+    # # Example usage
+    # results = evaluate_mesh_generation(
+    #     generated_obj_dir="Ours\reference_gt",
+    #     reference_obj_dir="Chair_samples\reference_gt",
+    #     output_path="METRICS_EVAL_OURS.json",
+    #     compute_visual_metrics=True  # Set False to skip FID/KID
+    # )
+    import random
+    generated_meshes_ours = load_meshes_from_obj_files(
+        generated_obj_dir_ours,
+        # max_meshes=EvaluationConfig.N_GENERATED
+        max_meshes=980
     )
+    generated_meshes_meshgpt = load_meshes_from_obj_files(
+        generated_obj_dir_meshgpt,
+        max_meshes=1000
+    )
+    reference_meshes = load_meshes_from_obj_files(
+        reference_obj_dir,
+        max_meshes=6000
+    )
+
+    # half = len(reference_meshes) // 2
+    # set_A = reference_meshes[:half]
+    # set_B = reference_meshes[half:]
+
+    import json
+    import os
+    import random
+    import csv
+    from datetime import datetime
+
+    results = []  # store all experiments
+
+    output_json = "mesh_metric_evaluation.json"
+    output_csv = "mesh_metric_evaluation.csv"
+
+    for ref_size in [1000]:
+    # for ref_size in [115]:
+        print("\n" + "=" * 80)
+        print(f"Evaluating with reference subset size: {ref_size}")
+        print("=" * 80)
+
+        # Randomly sample reference subset
+        ref_subset = random.sample(reference_meshes, ref_size)
+
+        # ====================================================
+        # --- MESH GPT ---
+        # ====================================================
+        dist_matrix = compute_pairwise_cd_matrix(generated_meshes_meshgpt, ref_subset, meshes1_is_meshgpt=False, meshes2_is_meshgpt=False)
+        print(f"Min: {dist_matrix.min():.4f}")
+        print(f"25th percentile: {np.percentile(dist_matrix, 25):.4f}")
+        print(f"Median: {np.median(dist_matrix):.4f}")
+        print(f"75th percentile: {np.percentile(dist_matrix, 75):.4f}")
+        print(f"Max: {dist_matrix.max():.4f}")
+        mmd = compute_mmd(dist_matrix, generated_meshes_meshgpt, ref_subset)
+        print(mmd)
+        cov = compute_coverage(dist_matrix, generated_meshes_meshgpt, ref_subset)
+        print(cov)# using fixed version (no threshold)
+        nna = compute_1nna(generated_meshes_meshgpt, ref_subset, meshes1_is_meshgpt=False, meshes2_is_meshgpt=False)
+        # nna = 50
+
+        print(f"MESHGPT output - Ref size {ref_size}: MMD={mmd:.3f}, COV={cov:.2f}, 1-NNA={nna:.2f}")
+
+        results.append({
+            "model": "MeshGPT",
+            "ref_size": ref_size,
+            "MMD": float(mmd),
+            "COV": float(cov),
+            "1-NNA": float(nna),
+            "timestamp": datetime.now().isoformat()
+        })
+
+        # ====================================================
+        # --- OUR MODEL ---
+        # ====================================================
+        dist_matrix = compute_pairwise_cd_matrix(generated_meshes_ours, ref_subset)
+        print(f"Min: {dist_matrix.min():.4f}")
+        print(f"25th percentile: {np.percentile(dist_matrix, 25):.4f}")
+        print(f"Median: {np.median(dist_matrix):.4f}")
+        print(f"75th percentile: {np.percentile(dist_matrix, 75):.4f}")
+        print(f"Max: {dist_matrix.max():.4f}")
+        mmd = compute_mmd(dist_matrix, generated_meshes_ours, ref_subset)
+        print(mmd)
+        cov = compute_coverage(dist_matrix, generated_meshes_ours, ref_subset)  # using fixed version (no threshold)
+        print(cov)
+        nna = compute_1nna(generated_meshes_ours, ref_subset)
+        # nna = 50
+        print(f"OURS output - Ref size {ref_size}: MMD={mmd:.3f}, COV={cov:.2f}, 1-NNA={nna:.2f}")
+
+        results.append({
+            "model": "Ours",
+            "ref_size": ref_size,
+            "MMD": float(mmd),
+            "COV": float(cov),
+            "1-NNA": float(nna),
+            "timestamp": datetime.now().isoformat()
+        })
+
+        # ====================================================
+        # --- Save partial results after each loop ---
+        # ====================================================
+        with open(output_json, "w") as f:
+            json.dump(results, f, indent=2)
+        print(f"✓ Results saved to {output_json}")
+
+        # Also write/update CSV file
+        write_header = not os.path.exists(output_csv)
+        with open(output_csv, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["model", "ref_size", "MMD", "COV", "1-NNA", "timestamp"])
+            if write_header:
+                writer.writeheader()
+            writer.writerow(results[-2])  # MeshGPT
+            writer.writerow(results[-1])  # Ours
+        print(f"✓ Results appended to {output_csv}")
+
+
+# Assume these functions are imported from your evaluation module
+# from evaluation_module import (
+#     load_meshes_from_obj_files,
+#     compute_pairwise_cd_matrix,
+#     compute_mmd,
+#     compute_coverage,
+#     compute_1nna
+# )
+
+import os
+import random
+import json
+import csv
+import numpy as np
+from datetime import datetime
+from pathlib import Path
+
+def mesh_samples_evaluation(mesh_dirs_path="mesh_samples",
+                            reference_dirs_path="C:\\Users\\koth_ak\\Akshat's Thesis\\Text-to-3D-MeshTransformer\\Data\\gt_mesh_samples",
+                            output_json="mesh_category_metrics.json", output_csv="mesh_category_metrics.csv",
+                            samples_per_category=50, repetitions=3):
+    mesh_dirs_path = Path(mesh_dirs_path)
+    reference_dirs_path = Path(reference_dirs_path)
+
+    results = []
+
+    # Loop over categories (folders) in generated meshes directory
+    for category_folder in mesh_dirs_path.iterdir():
+        if not category_folder.is_dir():
+            continue
+        category_name = category_folder.name
+        print(f"\n=== Evaluating category: {category_name} ===")
+
+        generated_mesh_dir = category_folder
+        reference_mesh_dir = reference_dirs_path / category_name
+
+        if not reference_mesh_dir.exists():
+            print(f"[WARNING] Reference directory not found for category '{category_name}', skipping.")
+            continue
+
+        # Load all meshes once per category
+        generated_meshes = load_meshes_from_obj_files(str(generated_mesh_dir))
+        reference_meshes = load_meshes_from_obj_files(str(reference_mesh_dir))
+
+        if len(generated_meshes) < samples_per_category or len(reference_meshes) < samples_per_category:
+            print(f"[WARNING] Not enough meshes in category '{category_name}' for sampling, skipping.")
+            continue
+
+        # Repeat evaluation multiple times for averaging
+        category_metrics = []
+        for rep in range(repetitions):
+            print(f"\n--- Repetition {rep + 1}/{repetitions} ---")
+
+            sampled_generated = random.sample(generated_meshes, samples_per_category)
+            sampled_reference = random.sample(reference_meshes, samples_per_category)
+
+            dist_matrix = compute_pairwise_cd_matrix(sampled_generated, sampled_reference)
+            mmd = compute_mmd(dist_matrix, sampled_generated, sampled_reference)
+            cov = compute_coverage(dist_matrix, sampled_generated, sampled_reference)
+            nna = compute_1nna(sampled_generated, sampled_reference)
+
+            print(f"Repetition {rep + 1} - MMD: {mmd:.3f}, COV: {cov:.2f}, 1-NNA: {nna:.2f}")
+            category_metrics.append({"MMD": mmd, "COV": cov, "1-NNA": nna})
+
+        # Compute average over repetitions
+        avg_mmd = float(np.mean([m["MMD"] for m in category_metrics]))
+        avg_cov = float(np.mean([m["COV"] for m in category_metrics]))
+        avg_nna = float(np.mean([m["1-NNA"] for m in category_metrics]))
+
+        results.append({
+            "category": category_name,
+            "samples_per_category": samples_per_category,
+            "repetitions": repetitions,
+            "avg_MMD": avg_mmd,
+            "avg_COV": avg_cov,
+            "avg_1-NNA": avg_nna,
+        })
+
+        # Save partial results after each category
+        with open(output_json, "w") as f:
+            json.dump(results, f, indent=2)
+        print(f"✓ JSON results saved to {output_json}")
+
+        # Save/update CSV
+        write_header = not os.path.exists(output_csv)
+        with open(output_csv, "a", newline="") as f:
+            writer = csv.DictWriter(f,
+                                    fieldnames=["category", "samples_per_category", "repetitions", "avg_MMD", "avg_COV",
+                                                "avg_1-NNA", "timestamp"])
+            if write_header:
+                writer.writeheader()
+            writer.writerow(results[-1])
+        print(f"✓ CSV results appended to {output_csv}")
+
+    print("\nAll categories processed.")
+
+
+if __name__ == "__main__":
+    # mesh_samples_evaluation()
+    run_comparison_evaluation()
