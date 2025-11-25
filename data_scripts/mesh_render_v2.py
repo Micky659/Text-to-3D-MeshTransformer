@@ -1,32 +1,4 @@
-"""
-Mesh utilities for text-to-3D pipeline.
-Use this in your scene generation pipeline to save meshes with proper scaling and metadata.
-"""
-
-import numpy as np
 import math
-import torch
-from pathlib import Path
-
-# Target dimensions for realistic scaling (in meters) [W, D, H]
-TARGET_DIMENSIONS = {
-    "bed": [1.5, 2.0, 0.6],
-    "chair": [0.5, 0.5, 0.9],
-    "table": [1.2, 0.8, 0.75],
-    "sofa": [2.0, 0.95, 0.85],
-    "desk": [1.4, 0.7, 0.75],
-    "lamp": [0.3, 0.3, 0.6],
-    "cabinet": [0.8, 0.5, 1.8],
-    "shelf": [1.0, 0.3, 1.5],
-    "nightstand": [0.5, 0.4, 0.5],
-    "coffee_table": [1.2, 0.6, 0.45],
-    "bookshelf": [0.8, 0.3, 1.8],
-    "tv_stand": [1.5, 0.4, 0.5],
-    "dresser": [1.2, 0.5, 0.9],
-    "wardrobe": [1.2, 0.6, 2.0],
-    # Add more as needed
-}
-
 
 def orient_triangle_upward(v1, v2, v3):
     """Ensure triangle normal points upward"""
@@ -83,10 +55,6 @@ def get_angle(v1, v2, v3):
 def extract_vertices_faces_from_mesh(mesh_output):
     """
     Extract vertices and compute oriented faces from a mesh tensor/mask format.
-
-    Returns:
-        vertices: np.ndarray of shape (N, 3)
-        faces: np.ndarray of shape (N/3, 3)
     """
     all_vertices = []
     all_faces = []
@@ -114,20 +82,18 @@ def extract_vertices_faces_from_mesh(mesh_output):
     # Calculate mesh center for face orientation
     mesh_center = np.mean(vertices, axis=0)
 
-    # Compute faces using the same logic you provided
+    # Compute faces
     for i in range(0, len(vertices), 3):
         v1, v2, v3 = vertices[i], vertices[i + 1], vertices[i + 2]
 
         normal = np.cross(v2 - v1, v3 - v1)
 
-        # Determine direction for face orientation
         if get_angle(v1, v2, v3) > 60:
             direction_vector = mesh_center - np.mean([v1, v2, v3], axis=0)
             direction_vector = -direction_vector
         else:
             direction_vector = np.array([0, 1, 0])
 
-        # Reorder vertices if needed
         if np.dot(normal, direction_vector) > 0:
             order = [0, 1, 2]
         else:
@@ -135,7 +101,6 @@ def extract_vertices_faces_from_mesh(mesh_output):
 
         reordered_vertices = [v1, v2, v3][order[0]], [v1, v2, v3][order[1]], [v1, v2, v3][order[2]]
 
-        # Find indices of reordered vertices in the global vertex array
         indices = [
             np.where((vertices == vertex).all(axis=1))[0][0]
             for vertex in reordered_vertices
@@ -152,13 +117,6 @@ def extract_vertices_faces_from_mesh(mesh_output):
 def scale_mesh_to_target(vertices, target_bbox):
     """
     Scale mesh to match target bounding box dimensions.
-
-    Args:
-        vertices: numpy array of shape (N, 3)
-        target_bbox: [width, depth, height] in meters (X, Z, Y ordering)
-
-    Returns:
-        scaled vertices centered at origin
     """
     if len(vertices) == 0:
         return vertices
@@ -189,19 +147,6 @@ def scale_mesh_to_target(vertices, target_bbox):
 
 
 def save_mesh_for_scene(path, mesh_output, category, custom_target_dims=None):
-    """
-    Save mesh for scene generation pipeline with proper scaling and orientation.
-    This is the function to use in your pipeline instead of mesh_render.save_rendering.
-
-    Args:
-        path: output file path
-        mesh_output: (tensor, mask) tuple from transformer.generate()
-        category: object category (e.g., 'bed', 'chair')
-        custom_target_dims: optional [w, d, h] override, if None uses TARGET_DIMENSIONS
-
-    Returns:
-        dict with metadata: bbox, anchor, bbox_center, num_faces
-    """
     # Extract vertices
     vertices = extract_vertices_from_mesh(mesh_output)
 
@@ -209,16 +154,15 @@ def save_mesh_for_scene(path, mesh_output, category, custom_target_dims=None):
         print(f"Warning: No vertices to save for {path}")
         return None
 
-    # Get target dimensions
-    target_dims = custom_target_dims if custom_target_dims else TARGET_DIMENSIONS.get(category)
+    # # Get target dimensions
+    # target_dims = custom_target_dims if custom_target_dims else TARGET_DIMENSIONS.get(category)
+    #
+    # # Scale if target dimensions available
+    # if target_dims is not None:
+    #     vertices = scale_mesh_to_target(vertices, target_dims)
+    # else:
+    #     print(f"Warning: No target dimensions for category '{category}', saving unscaled")
 
-    # Scale if target dimensions available
-    if target_dims is not None:
-        vertices = scale_mesh_to_target(vertices, target_dims)
-    else:
-        print(f"Warning: No target dimensions for category '{category}', saving unscaled")
-
-    # Prepare OBJ content
     all_vertices = []
     all_faces = []
 
@@ -237,14 +181,12 @@ def save_mesh_for_scene(path, mesh_output, category, custom_target_dims=None):
 
         normal = np.cross(v2 - v1, v3 - v1)
 
-        # Determine direction for face orientation
         if get_angle(v1, v2, v3) > 60:
             direction_vector = mesh_center - np.mean([v1, v2, v3], axis=0)
             direction_vector = -direction_vector
         else:
             direction_vector = np.array([0, 1, 0])
 
-        # Reorder vertices if needed
         if np.dot(normal, direction_vector) > 0:
             order = [0, 1, 2]
         else:
@@ -263,9 +205,9 @@ def save_mesh_for_scene(path, mesh_output, category, custom_target_dims=None):
     metadata = compute_mesh_metadata(vertices)
 
     print(f"[save_mesh_for_scene] Saved '{category}' to {path}")
-    if target_dims:
-        print(f"  Scaled to: W={target_dims[0]:.2f}m, D={target_dims[1]:.2f}m, H={target_dims[2]:.2f}m")
-    print(f"  BBox: {metadata['bbox']}, Anchor: {metadata['anchor']}")
+    # if target_dims:
+    #     print(f"  Scaled to: W={target_dims[0]:.2f}m, D={target_dims[1]:.2f}m, H={target_dims[2]:.2f}m")
+    # print(f"  BBox: {metadata['bbox']}, Anchor: {metadata['anchor']}")
 
     return metadata
 
@@ -273,12 +215,6 @@ def save_mesh_for_scene(path, mesh_output, category, custom_target_dims=None):
 def compute_mesh_metadata(vertices):
     """
     Compute metadata from vertices.
-
-    Args:
-        vertices: numpy array of shape (N, 3)
-
-    Returns:
-        dict with bbox, anchor, bbox_center, num_faces
     """
     if len(vertices) == 0:
         return {
@@ -342,24 +278,3 @@ def extract_cleaned_vertices_from_mesh(mesh_output):
         return np.vstack(all_vertices)
     else:
         return np.array([]).reshape(0, 3)
-
-# Example usage in your pipeline:
-"""
-# Replace this:
-# mesh_render.save_rendering(str(out_obj), [raw_mesh])
-
-# With this:
-from mesh_utils_pipeline import save_mesh_for_scene
-
-metadata = save_mesh_for_scene(
-    path=str(out_obj),
-    mesh_output=raw_mesh,
-    category=category,
-    custom_target_dims=None  # or specify [w, d, h] to override
-)
-
-# Store metadata for LLM layout planner
-if metadata:
-    # Save to your categories_table or metadata JSON
-    categories_table[category] = metadata
-"""

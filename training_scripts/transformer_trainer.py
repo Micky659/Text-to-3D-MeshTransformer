@@ -1,33 +1,21 @@
 from __future__ import annotations
-
 from pathlib import Path
 from functools import partial
 from contextlib import nullcontext
-
 from torch.utils.data import Dataset, DataLoader
 from torch.optim.lr_scheduler import _LRScheduler
-
-from pytorch_custom_utils import (
-    get_adam_optimizer,
-    OptimizerWithWarmupSchedule
-)
-
+from pytorch_custom_utils import get_adam_optimizer, OptimizerWithWarmupSchedule
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
-
 from beartype.typing import Tuple, Type, List
 from data_scripts.typing_mod import typecheck, beartype_isinstance
-
 from data_scripts.helper_funcs import *
-
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 from model_scripts.transformer import MeshTransformer
 
 
-DEFAULT_DDP_KWARGS = DistributedDataParallelKwargs(
-    find_unused_parameters = True
-)
+DDPK = DistributedDataParallelKwargs(find_unused_parameters=True)
 
 
 class MeshTransformerTrainer(Module):
@@ -43,103 +31,75 @@ class MeshTransformerTrainer(Module):
             weight_decay: float = 0.,
             max_grad_norm: float | None = 0.5,
             val_dataset: Dataset | None = None,
-            val_every = 1,
-            val_num_batches = 5,
+            val_every=1,
+            val_num_batches=5,
             scheduler: Type[_LRScheduler] | None = None,
             scheduler_kwargs: dict = dict(),
             ema_kwargs: dict = dict(),
             accelerator_kwargs: dict = dict(),
             optimizer_kwargs: dict = dict(),
-
-            checkpoint_every = 1000,
+            checkpoint_every=1000,
             checkpoint_every_epoch: Type[int] | None = None,
-            checkpoint_folder = './checkpoints',
+            checkpoint_folder='./checkpoints',
             data_kwargs: Tuple[str, ...] = ('vertices', 'faces', 'face_edges', 'text'),
-            warmup_steps = 1000,
-            use_wandb_tracking = False
+            warmup_steps=1000,
+            use_wandb_tracking=False
     ):
         super().__init__()
 
-        # experiment tracker
-
-        self.use_wandb_tracking = use_wandb_tracking
+        self.use_wandb = use_wandb_tracking
 
         if use_wandb_tracking:
             accelerator_kwargs['log_with'] = 'wandb'
 
         if 'kwargs_handlers' not in accelerator_kwargs:
-            accelerator_kwargs['kwargs_handlers'] = [DEFAULT_DDP_KWARGS]
+            accelerator_kwargs['kwargs_handlers'] = [DDPK]
 
-        self.accelerator = Accelerator(**accelerator_kwargs)
-
+        self.acc = Accelerator(**accelerator_kwargs)
         self.model = model
 
-        optimizer = get_adam_optimizer(
-            model.parameters(),
-            lr = learning_rate,
-            wd = weight_decay,
-            filter_by_requires_grad = True,
-            **optimizer_kwargs
-        )
+        opt = get_adam_optimizer(model.parameters(), lr=learning_rate, wd=weight_decay,
+                                 filter_by_requires_grad=True, **optimizer_kwargs)
 
-        self.optimizer = OptimizerWithWarmupSchedule(
-            accelerator = self.accelerator,
-            optimizer = optimizer,
-            scheduler = scheduler,
-            scheduler_kwargs = scheduler_kwargs,
-            warmup_steps = warmup_steps,
-            max_grad_norm = max_grad_norm
-        )
+        self.opt = OptimizerWithWarmupSchedule(
+            accelerator=self.acc,
+            optimizer=opt,
+            scheduler=scheduler,
+            scheduler_kwargs=scheduler_kwargs,
+            warmup_steps=warmup_steps,
+            max_grad_norm=max_grad_norm)
 
-        self.dataloader = DataLoader(
-            dataset,
-            shuffle = True,
-            batch_size = batch_size,
-            drop_last = True,
-            collate_fn = partial(custom_collate, pad_id = model.pad_id)
-        )
+        self.dl = DataLoader(dataset, shuffle=True, batch_size=batch_size, drop_last=True,
+                            collate_fn=partial(custom_collate, pad_id=model.pad_id))
 
-        self.should_validate = exists(val_dataset)
+        self.val_flag = exists(val_dataset)
 
-        if self.should_validate:
-            assert len(val_dataset) > 0, 'your validation dataset is empty'
-
+        if self.val_flag:
+            assert len(val_dataset) > 0
             self.val_every = val_every
-            self.val_num_batches = val_num_batches
-
-            self.val_dataloader = DataLoader(
-                val_dataset,
-                shuffle = True,
-                batch_size = batch_size,
-                drop_last = True,
-                collate_fn = partial(custom_collate, pad_id = model.pad_id)
-            )
+            self.val_nb = val_num_batches
+            self.vdl = DataLoader(val_dataset, shuffle=True, batch_size=batch_size, drop_last=True,
+                                 collate_fn=partial(custom_collate, pad_id=model.pad_id))
 
         if hasattr(dataset, 'data_kwargs') and exists(dataset.data_kwargs):
             assert beartype_isinstance(dataset.data_kwargs, List[str])
-            self.data_kwargs = dataset.data_kwargs
+            self.dk = dataset.data_kwargs
         else:
-            self.data_kwargs = data_kwargs
+            self.dk = data_kwargs
 
-        (
-            self.model,
-            self.dataloader
-        ) = self.accelerator.prepare(
-            self.model,
-            self.dataloader
-        )
+        (self.model, self.dl) = self.acc.prepare(self.model, self.dl)
 
-        self.grad_accum_every = grad_accum_every
-        self.num_train_steps = num_train_steps
+        self.gae = grad_accum_every
+        self.nts = num_train_steps
         self.register_buffer('step', torch.tensor(0))
 
-        self.checkpoint_every_epoch = checkpoint_every_epoch
-        self.checkpoint_every = checkpoint_every
-        self.checkpoint_folder = Path(checkpoint_folder)
-        self.checkpoint_folder.mkdir(exist_ok = True, parents = True)
+        self.cke = checkpoint_every_epoch
+        self.ck = checkpoint_every
+        self.ckf = Path(checkpoint_folder)
+        self.ckf.mkdir(exist_ok=True, parents=True)
 
-    def log(self, **data_kwargs):
-        self.accelerator.log(data_kwargs, step = self.step.item())
+    def log(self, **kw):
+        self.acc.log(kw, step=self.step.item())
 
     @property
     def device(self):
@@ -147,43 +107,37 @@ class MeshTransformerTrainer(Module):
 
     @property
     def is_main(self):
-        return self.accelerator.is_main_process
+        return self.acc.is_main_process
 
     @property
     def unwrapped_model(self):
-        return self.accelerator.unwrap_model(self.model)
+        return self.acc.unwrap_model(self.model)
 
     @property
     def is_local_main(self):
-        return self.accelerator.is_local_main_process
+        return self.acc.is_local_main_process
 
     def wait(self):
-        return self.accelerator.wait_for_everyone()
+        return self.acc.wait_for_everyone()
 
     def print(self, msg):
-        return self.accelerator.print(msg)
+        return self.acc.print(msg)
 
-    def next_data_to_forward_kwargs(self, dl_iter) -> dict:
-        data = next(dl_iter)
+    def next_data_to_forward_kwargs(self, dli) -> dict:
+        d = next(dli)
 
-        if isinstance(data, tuple):
-            forward_kwargs = dict(zip(self.data_kwargs, data))
+        if isinstance(d, tuple):
+            fk = dict(zip(self.dk, d))
+        elif isinstance(d, dict):
+            fk = d
 
-        elif isinstance(data, dict):
-            forward_kwargs = data
+        return fk
 
-        return forward_kwargs
-
-    def save(self, path, overwrite = True):
+    def save(self, path, overwrite=True):
         path = Path(path)
         assert overwrite or not path.exists()
 
-        pkg = dict(
-            model = self.unwrapped_model.state_dict(),
-            optimizer = self.optimizer.state_dict(),
-            step = self.step.item()
-        )
-
+        pkg = dict(model=self.unwrapped_model.state_dict(), optimizer=self.opt.state_dict(), step=self.step.item())
         torch.save(pkg, str(path))
 
     def load(self, path):
@@ -191,138 +145,120 @@ class MeshTransformerTrainer(Module):
         assert path.exists()
 
         pkg = torch.load(str(path))
-
         self.model.load_state_dict(pkg['model'])
-        self.optimizer.load_state_dict(pkg['optimizer'])
+        self.opt.load_state_dict(pkg['optimizer'])
         self.step.copy_(pkg['step'])
 
     def forward(self):
-        step = self.step.item()
-        dl_iter = cycle(self.dataloader)
+        s = self.step.item()
+        dli = cycle(self.dl)
 
-        if self.should_validate:
-            val_dl_iter = cycle(self.val_dataloader)
+        if self.val_flag:
+            vdli = cycle(self.vdl)
 
-        while step < self.num_train_steps:
+        while s < self.nts:
+            for i in range(self.gae):
+                isl = i == (self.gae - 1)
+                mns = partial(self.acc.no_sync, self.model) if not isl else nullcontext
 
-            for i in range(self.grad_accum_every):
-                is_last = i == (self.grad_accum_every - 1)
-                maybe_no_sync = partial(self.accelerator.no_sync, self.model) if not is_last else nullcontext
+                fk = self.next_data_to_forward_kwargs(dli)
 
-                forward_kwargs = self.next_data_to_forward_kwargs(dl_iter)
+                with self.acc.autocast(), mns():
+                    l = self.model(**fk)
+                    self.acc.backward(l / self.gae)
 
-                with self.accelerator.autocast(), maybe_no_sync():
-                    loss = self.model(**forward_kwargs)
+            self.print(f'loss: {l.item():.3f}')
+            self.log(loss=l.item())
 
-                    self.accelerator.backward(loss / self.grad_accum_every)
+            self.opt.step()
+            self.opt.zero_grad()
 
-            self.print(f'loss: {loss.item():.3f}')
-
-            self.log(loss = loss.item())
-
-            self.optimizer.step()
-            self.optimizer.zero_grad()
-
-            step += 1
+            s += 1
             self.step.add_(1)
-
             self.wait()
 
-            if self.is_main and self.should_validate and divisible_by(step, self.val_every):
-
-                total_val_loss = 0.
+            if self.is_main and self.val_flag and divisible_by(s, self.val_every):
+                tvl = 0.
                 self.unwrapped_model.eval()
+                nvb = self.val_nb * self.gae
 
-                num_val_batches = self.val_num_batches * self.grad_accum_every
+                for _ in range(nvb):
+                    with self.acc.autocast(), torch.no_grad():
+                        fk = self.next_data_to_forward_kwargs(vdli)
+                        vl = self.unwrapped_model(**fk)
+                        tvl += (vl / nvb)
 
-                for _ in range(num_val_batches):
-                    with self.accelerator.autocast(), torch.no_grad():
-
-                        forward_kwargs = self.next_data_to_forward_kwargs(val_dl_iter)
-
-                        val_loss = self.unwrapped_model(**forward_kwargs)
-
-                        total_val_loss += (val_loss / num_val_batches)
-
-                self.print(f'valid recon loss: {total_val_loss:.3f}')
-
-                self.log(val_loss = total_val_loss)
+                self.print(f'valid recon loss: {tvl:.3f}')
+                self.log(val_loss=tvl)
 
             self.wait()
 
-            if self.is_main and divisible_by(step, self.checkpoint_every):
-                checkpoint_num = step // self.checkpoint_every
-                self.save(self.checkpoint_folder / f'mesh-transformer.ckpt.{checkpoint_num}.pt')
+            if self.is_main and divisible_by(s, self.ck):
+                cn = s // self.ck
+                self.save(self.ckf / f'mesh-transformer.ckpt.{cn}.pt')
 
             self.wait()
 
         self.print('training complete')
 
-
-    def train(self, num_epochs, stop_at_loss = None, diplay_graph = False, start_epoch=0):
-        epoch_losses = []
-        epoch_size = len(self.dataloader)
+    def train(self, num_epochs, stop_at_loss=None, diplay_graph=False, start_epoch=0):
+        el = []
+        es = len(self.dl)
         self.model.train()
 
-        for epoch in range(num_epochs):
-            new_epoch = start_epoch + epoch
-            total_epoch_loss = 0.0
+        for e in range(num_epochs):
+            ne = start_epoch + e
+            tel = 0.0
 
-            progress_bar = tqdm(enumerate(self.dataloader), desc=f'Epoch {new_epoch + 1}/{start_epoch + num_epochs}', total=len(self.dataloader))
-            for batch_idx, batch in progress_bar:
+            pb = tqdm(enumerate(self.dl), desc=f'Epoch {ne + 1}/{start_epoch + num_epochs}', total=len(self.dl))
+            for bi, b in pb:
+                isl = (bi + 1) % self.gae == 0
+                mns = partial(self.acc.no_sync, self.model) if not isl else nullcontext
 
-                is_last = (batch_idx +1) % self.grad_accum_every == 0
-                maybe_no_sync = partial(self.accelerator.no_sync, self.model) if not is_last else nullcontext
+                with self.acc.autocast(), mns():
+                    tl = self.model(**b)
+                    self.acc.backward(tl / self.gae)
 
-                with self.accelerator.autocast(), maybe_no_sync():
-                    total_loss = self.model(**batch)
-                    self.accelerator.backward(total_loss / self.grad_accum_every)
+                cl = tl.item()
+                tel += cl
+                pb.set_postfix(loss=cl)
 
-                current_loss = total_loss.item()
-                total_epoch_loss += current_loss
+                if isl or (bi + 1 == len(self.dl)):
+                    self.opt.step()
+                    self.opt.zero_grad()
 
-                progress_bar.set_postfix(loss=current_loss)
+            ael = tel / es
+            eo = f'Epoch {ne + 1} average loss: {ael}'
 
-                if is_last or (batch_idx + 1 == len(self.dataloader)):
-                    self.optimizer.step()
-                    self.optimizer.zero_grad()
+            el.append(ael)
 
-            avg_epoch_loss = total_epoch_loss / epoch_size
-            epochOut = f'Epoch {new_epoch + 1} average loss: {avg_epoch_loss}'
-
-
-            epoch_losses.append(avg_epoch_loss)
-
-            if len(epoch_losses) >= 4 and avg_epoch_loss > 0:
-                avg_loss_improvement = sum(epoch_losses[-4:-1]) / 3 - avg_epoch_loss
-                epochOut += f'          avg loss speed: {avg_loss_improvement}'
-                if avg_loss_improvement > 0 and avg_loss_improvement < 0.2:
-                    epochs_until_0_3 = max(0, abs(avg_epoch_loss -0.3) / avg_loss_improvement)
-                    if epochs_until_0_3> 0:
-                        epochOut += f' epochs left: {epochs_until_0_3:.2f}'
+            if len(el) >= 4 and ael > 0:
+                ali = sum(el[-4:-1]) / 3 - ael
+                eo += f'          avg loss speed: {ali}'
+                if ali > 0 and ali < 0.2:
+                    eu03 = max(0, abs(ael - 0.3) / ali)
+                    if eu03 > 0:
+                        eo += f' epochs left: {eu03:.2f}'
 
             self.wait()
-            self.print(epochOut)
+            self.print(eo)
 
-            if self.is_main and self.checkpoint_every_epoch is not None and \
-                    (self.checkpoint_every_epoch == 1 or (new_epoch != 0 and new_epoch % self.checkpoint_every_epoch == 0)):
-                self.save(
-                    self.checkpoint_folder / f'mesh-transformer.ckpt.epoch_{new_epoch}_avg_loss_{avg_epoch_loss:.3f}.pt')
+            if self.is_main and self.cke is not None and (self.cke == 1 or (ne != 0 and ne % self.cke == 0)):
+                self.save(self.ckf / f'mesh-transformer.ckpt.epoch_{ne}_avg_loss_{ael:.3f}.pt')
 
-            if stop_at_loss is not None and avg_epoch_loss < stop_at_loss:
-                self.print(f'Stopping training at epoch {new_epoch} with average loss {avg_epoch_loss}')
-                if self.is_main and self.checkpoint_every_epoch is not None:
-                    self.save(
-                        self.checkpoint_folder / f'mesh-transformer.ckpt.stop_at_loss_avg_loss_{avg_epoch_loss:.3f}.pt')
+            if stop_at_loss is not None and ael < stop_at_loss:
+                self.print(f'Stopping training at epoch {ne} with average loss {ael}')
+                if self.is_main and self.cke is not None:
+                    self.save(self.ckf / f'mesh-transformer.ckpt.stop_at_loss_avg_loss_{ael:.3f}.pt')
                 break
 
         self.print('Training complete')
         if diplay_graph:
             plt.figure(figsize=(10, 5))
-            plt.plot(range(1, len(epoch_losses) + 1), epoch_losses, marker='o', label='Total Loss')
+            plt.plot(range(1, len(el) + 1), el, marker='o', label='Total Loss')
             plt.title('Training Loss Over Epochs')
             plt.xlabel('Epoch')
             plt.ylabel('Average Loss')
             plt.grid(True)
             plt.show()
-        return epoch_losses[-1]
+        return el[-1]

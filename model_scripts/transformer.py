@@ -1,36 +1,15 @@
 from __future__ import annotations
-
 from pathlib import Path
-
 from pytorch_custom_utils import save_load
-
-from beartype.typing import Tuple, Callable, List, Dict, Any
-
-from huggingface_hub import PyTorchModelHubMixin, hf_hub_download
-
+from beartype.typing import Tuple, Callable, List
+from huggingface_hub import PyTorchModelHubMixin
 from einops import rearrange, repeat, reduce, pack, unpack
-
 from x_transformers import Decoder
-from x_transformers.x_transformers import RMSNorm, FeedForward, LayerIntermediates
-
-from x_transformers.autoregressive_wrapper import (
-    eval_decorator,
-    top_k,
-    top_p,
-)
-
-from classifier_free_guidance_pytorch import (
-    classifier_free_guidance,
-    TextEmbeddingReturner
-)
-
+from x_transformers.x_transformers import RMSNorm, FeedForward
+from x_transformers.autoregressive_wrapper import top_k
+from classifier_free_guidance_pytorch import classifier_free_guidance, TextEmbeddingReturner
 from gateloop_transformer import SimpleGateLoopLayer
-
 from tqdm import tqdm
-
-from data_scripts.BPT import BPT_deserialize
-import numpy as np
-
 from data_scripts.helper_funcs import *
 from model_scripts.resnet import FiLM
 from data_scripts.typing_mod import Int
@@ -38,47 +17,33 @@ from model_scripts.autoencoder import MeshAutoencoder
 
 
 class GateLoopBlock(Module):
-    def __init__(
-        self,
-        dim,
-        *,
-        depth,
-        use_heinsen = True
-    ):
+    def __init__(self, dim, *, depth, use_heinsen=True):
         super().__init__()
-        self.gateloops = ModuleList([])
+        self.gateloops = ModuleList([SimpleGateLoopLayer(dim=dim, use_heinsen=use_heinsen) for _ in range(depth)])
 
-        for _ in range(depth):
-            gateloop = SimpleGateLoopLayer(dim = dim, use_heinsen = use_heinsen)
-            self.gateloops.append(gateloop)
-
-    def forward(
-        self,
-        x,
-        cache = None
-    ):
-        received_cache = exists(cache)
+    def forward(self, x, cache=None):
+        rcv = exists(cache)
 
         if is_tensor_empty(x):
             return x, None
 
-        if received_cache:
+        if rcv:
             prev, x = x[:, :-1], x[:, -1:]
 
         cache = default(cache, [])
         cache = iter(cache)
 
-        new_caches = []
-        for gateloop in self.gateloops:
-            layer_cache = next(cache, None)
-            out, new_cache = gateloop(x, cache = layer_cache, return_cache = True)
-            new_caches.append(new_cache)
+        nc = []
+        for gl in self.gateloops:
+            lc = next(cache, None)
+            out, new_c = gl(x, cache=lc, return_cache=True)
+            nc.append(new_c)
             x = x + out
 
-        if received_cache:
-            x = torch.cat((prev, x), dim = -2)
+        if rcv:
+            x = torch.cat((prev, x), dim=-2)
 
-        return x, new_caches
+        return x, nc
 
 
 @save_load()
@@ -94,11 +59,8 @@ class MeshTransformer(Module, PyTorchModelHubMixin):
             attn_depth=12,
             attn_dim_head=64,
             attn_heads=16,
-            attn_kwargs: dict = dict(
-                ff_glu=True,
-                attn_num_mem_kv=4
-            ),
-            cross_attn_num_mem_kv=4,  # needed for preventing nan when dropping out text condition
+            attn_kwargs: dict = dict(ff_glu=True, attn_num_mem_kv=4),
+            cross_attn_num_mem_kv=4,
             dropout=0.,
             coarse_pre_gateloop_depth=2,
             coarse_post_gateloop_depth=0,
@@ -108,7 +70,7 @@ class MeshTransformer(Module, PyTorchModelHubMixin):
             fine_attn_depth=2,
             fine_attn_dim_head=32,
             fine_attn_heads=8,
-            fine_cross_attend_text=False,  # additional conditioning - fine transformer cross attention to text tokens
+            fine_cross_attend_text=False,
             pad_id=-1,
             num_sos_tokens=None,
             condition_on_text=False,
@@ -121,175 +83,80 @@ class MeshTransformer(Module, PyTorchModelHubMixin):
         super().__init__()
         self.num_vertices_per_face = 3 if not quads else 4
 
-        assert autoencoder.num_vertices_per_face == self.num_vertices_per_face, 'autoencoder and transformer must both support the same type of mesh (either all triangles, or all quads)'
+        assert autoencoder.num_vertices_per_face == self.num_vertices_per_face
 
-        dim, dim_fine = (dim, dim) if isinstance(dim, int) else dim
+        d, df = (dim, dim) if isinstance(dim, int) else dim
 
         self.autoencoder = autoencoder
         set_module_requires_grad_(autoencoder, False)
 
         self.codebook_size = autoencoder.codebook_size
         self.num_quantizers = autoencoder.num_quantizers
-
         self.eos_token_id = self.codebook_size
 
-        # self.use_bpt = False
-        # self.bpt_block_size = 16
-        # self.bpt_offset_size = 16
-        # self.bpt_use_special_block = False
-        #
-
-        # the fine transformer sos token
-        # as well as a projection of pooled text embeddings to condition it
-
         num_sos_tokens = default(num_sos_tokens, 1 if not condition_on_text else 4)
-        assert num_sos_tokens > 0
-
         self.num_sos_tokens = num_sos_tokens
-        self.sos_token = nn.Parameter(torch.randn(num_sos_tokens, dim))
+        self.sos_token = nn.Parameter(torch.randn(num_sos_tokens, d))
 
-        # they use axial positional embeddings
+        assert divisible_by(max_seq_len, self.num_vertices_per_face * self.num_quantizers)
 
-        assert divisible_by(max_seq_len,
-                            self.num_vertices_per_face * self.num_quantizers), f'max_seq_len ({max_seq_len}) must be divisible by (3 x {self.num_quantizers}) = {3 * self.num_quantizers}'  # 3 or 4 vertices per face, with D codes per vertex
-
-        self.token_embed = nn.Embedding(self.codebook_size + 1, dim)
-
-        self.quantize_level_embed = nn.Parameter(torch.randn(self.num_quantizers, dim))
-        self.vertex_embed = nn.Parameter(torch.randn(self.num_vertices_per_face, dim))
-
-        self.abs_pos_emb = nn.Embedding(max_seq_len, dim)
-
+        self.token_embed = nn.Embedding(self.codebook_size + 1, d)
+        self.quantize_level_embed = nn.Parameter(torch.randn(self.num_quantizers, d))
+        self.vertex_embed = nn.Parameter(torch.randn(self.num_vertices_per_face, d))
+        self.abs_pos_emb = nn.Embedding(max_seq_len, d)
         self.max_seq_len = max_seq_len
-
-        # text condition
 
         self.condition_on_text = condition_on_text
         self.conditioner = None
 
-        cross_attn_dim_context = None
-        dim_text = None
+        ca_ctx = None
+        dt = None
 
         if condition_on_text:
             self.conditioner = TextEmbeddingReturner(
                 model_types=text_condition_model_types,
                 model_kwargs=text_condition_model_kwargs,
                 cond_drop_prob=text_condition_cond_drop_prob,
-                text_embed_pad_value=-1.
-            )
+                text_embed_pad_value=-1.)
 
-            dim_text = self.conditioner.dim_latent
-            cross_attn_dim_context = dim_text
+            dt = self.conditioner.dim_latent
+            ca_ctx = dt
 
-            self.text_coarse_film_cond = FiLM(dim_text, dim) if text_cond_with_film else identity
-            self.text_fine_film_cond = FiLM(dim_text, dim_fine) if text_cond_with_film else identity
+            self.text_coarse_film_cond = FiLM(dt, d) if text_cond_with_film else identity
+            self.text_fine_film_cond = FiLM(dt, df) if text_cond_with_film else identity
 
-        # for summarizing the vertices of each face
+        self.to_face_tokens = nn.Sequential(nn.Linear(self.num_quantizers * self.num_vertices_per_face * d, d),
+                                            nn.LayerNorm(d))
 
-        self.to_face_tokens = nn.Sequential(
-            nn.Linear(self.num_quantizers * self.num_vertices_per_face * dim, dim),
-            nn.LayerNorm(dim)
-        )
-
-        self.coarse_gateloop_block = GateLoopBlock(dim, depth=coarse_pre_gateloop_depth,
+        self.coarse_gateloop_block = GateLoopBlock(d, depth=coarse_pre_gateloop_depth,
                                                    use_heinsen=gateloop_use_heinsen) if coarse_pre_gateloop_depth > 0 else None
 
-        self.coarse_post_gateloop_block = GateLoopBlock(dim, depth=coarse_post_gateloop_depth,
+        self.coarse_post_gateloop_block = GateLoopBlock(d, depth=coarse_post_gateloop_depth,
                                                         use_heinsen=gateloop_use_heinsen) if coarse_post_gateloop_depth > 0 else None
-
-        # main autoregressive attention network
-        # attending to a face token
 
         self.coarse_adaptive_rmsnorm = coarse_adaptive_rmsnorm
 
-        self.decoder = Decoder(
-            dim=dim,
-            depth=attn_depth,
-            heads=attn_heads,
-            attn_dim_head=attn_dim_head,
-            attn_flash=flash_attn,
-            attn_dropout=dropout,
-            ff_dropout=dropout,
-            use_adaptive_rmsnorm=coarse_adaptive_rmsnorm,
-            dim_condition=dim_text,
-            cross_attend=condition_on_text,
-            cross_attn_dim_context=cross_attn_dim_context,
-            cross_attn_num_mem_kv=cross_attn_num_mem_kv,
-            **attn_kwargs
-        )
+        self.decoder = Decoder(dim=d, depth=attn_depth, heads=attn_heads, attn_dim_head=attn_dim_head,
+                               attn_flash=flash_attn, attn_dropout=dropout, ff_dropout=dropout,
+                               use_adaptive_rmsnorm=coarse_adaptive_rmsnorm, dim_condition=dt,
+                               cross_attend=condition_on_text, cross_attn_dim_context=ca_ctx,
+                               cross_attn_num_mem_kv=cross_attn_num_mem_kv, **attn_kwargs)
 
-        # projection from coarse to fine, if needed
+        self.maybe_project_coarse_to_fine = nn.Linear(d, df) if d != df else nn.Identity()
 
-        self.maybe_project_coarse_to_fine = nn.Linear(dim, dim_fine) if dim != dim_fine else nn.Identity()
-
-        # address a weakness in attention
-
-        self.fine_gateloop_block = GateLoopBlock(dim, depth=fine_pre_gateloop_depth,
+        self.fine_gateloop_block = GateLoopBlock(d, depth=fine_pre_gateloop_depth,
                                                  use_heinsen=gateloop_use_heinsen) if fine_pre_gateloop_depth > 0 else None
-
-        # decoding the vertices, 2-stage hierarchy
 
         self.fine_cross_attend_text = condition_on_text and fine_cross_attend_text
 
-        self.fine_decoder = Decoder(
-            dim=dim_fine,
-            depth=fine_attn_depth,
-            heads=attn_heads,
-            attn_dim_head=attn_dim_head,
-            attn_flash=flash_attn,
-            attn_dropout=dropout,
-            ff_dropout=dropout,
-            cross_attend=self.fine_cross_attend_text,
-            cross_attn_dim_context=cross_attn_dim_context,
-            cross_attn_num_mem_kv=cross_attn_num_mem_kv,
-            **attn_kwargs
-        )
+        self.fine_decoder = Decoder(dim=df, depth=fine_attn_depth, heads=attn_heads, attn_dim_head=attn_dim_head,
+                                    attn_flash=flash_attn, attn_dropout=dropout, ff_dropout=dropout,
+                                    cross_attend=self.fine_cross_attend_text, cross_attn_dim_context=ca_ctx,
+                                    cross_attn_num_mem_kv=cross_attn_num_mem_kv, **attn_kwargs)
 
-        # to logits
-
-        self.to_logits = nn.Linear(dim_fine, self.codebook_size + 1)
-
-        # padding id
-        # force the autoencoder to use the same pad_id given in transformer
-
+        self.to_logits = nn.Linear(df, self.codebook_size + 1)
         self.pad_id = pad_id
         autoencoder.pad_id = pad_id
-
-    @classmethod
-    def _from_pretrained(
-            cls,
-            *,
-            model_id: str,
-            revision: str | None,
-            cache_dir: str | Path | None,
-            force_download: bool,
-            proxies: Dict | None,
-            resume_download: bool,
-            local_files_only: bool,
-            token: str | bool | None,
-            map_location: str = "cpu",
-            strict: bool = False,
-            **model_kwargs,
-    ):
-        model_filename = "mesh-transformer.bin"
-        model_file = Path(model_id) / model_filename
-
-        if not model_file.exists():
-            model_file = hf_hub_download(
-                repo_id=model_id,
-                filename=model_filename,
-                revision=revision,
-                cache_dir=cache_dir,
-                force_download=force_download,
-                proxies=proxies,
-                resume_download=resume_download,
-                token=token,
-                local_files_only=local_files_only,
-            )
-
-        model = cls.init_and_load(model_file, strict=strict)
-        model.to(map_location)
-        return model
 
     @property
     def device(self):
@@ -298,495 +165,283 @@ class MeshTransformer(Module, PyTorchModelHubMixin):
     @typecheck
     @torch.no_grad()
     def embed_texts(self, texts: str | List[str]):
-        single_text = not isinstance(texts, list)
-        if single_text:
+        s = not isinstance(texts, list)
+        if s:
             texts = [texts]
 
         assert exists(self.conditioner)
-        text_embeds = self.conditioner.embed_texts(texts).detach()
+        te = self.conditioner.embed_texts(texts).detach()
 
-        if single_text:
-            text_embeds = text_embeds[0]
+        if s:
+            te = te[0]
 
-        return text_embeds
+        return te
 
-    @eval_decorator
     @torch.no_grad()
     @typecheck
-    def generate(
-            self,
-            prompt: Tensor | None = None,
-            batch_size: int | None = None,
-            filter_logits_fn: Callable = top_k,
-            filter_kwargs: dict = dict(),
-            temperature=1.,
-            return_codes=False,
-            texts: List[str] | None = None,
-            text_embeds: Tensor | None = None,
-            cond_scale=1.,
-            cache_kv=True,
-            max_seq_len=None,
-            face_coords_to_file: Callable[[Tensor], Any] | None = None
-    ):
-        max_seq_len = default(max_seq_len, self.max_seq_len)
+    def generate(self, prompt: Tensor | None = None, batch_size: int | None = None, filter_logits_fn: Callable = top_k,
+                 filter_kwargs: dict = dict(), temperature=1., return_codes=False, texts: List[str] | None = None,
+                 text_embeds: Tensor | None = None, cond_scale=1., cache_kv=True, max_seq_len=None,
+                 face_coords_to_file: Callable[[Tensor], Any] | None = None):
+
+        msl = default(max_seq_len, self.max_seq_len)
 
         if exists(prompt):
             assert not exists(batch_size)
-
             prompt = rearrange(prompt, 'b ... -> b (...)')
             assert prompt.shape[-1] <= self.max_seq_len
-
             batch_size = prompt.shape[0]
 
         if self.condition_on_text:
-            assert exists(texts) ^ exists(
-                text_embeds), '`text` or `text_embeds` must be passed in if `condition_on_text` is set to True'
+            assert exists(texts) ^ exists(text_embeds)
             if exists(texts):
                 text_embeds = self.embed_texts(texts)
-
             batch_size = default(batch_size, text_embeds.shape[0])
 
         batch_size = default(batch_size, 1)
-
         codes = default(prompt, torch.empty((batch_size, 0), dtype=torch.long, device=self.device))
-
-        curr_length = codes.shape[-1]
-
+        cl = codes.shape[-1]
         cache = (None, None)
 
-        for i in tqdm(range(curr_length, max_seq_len)):
+        for i in tqdm(range(cl, msl)):
+            can_eos = i != 0 and divisible_by(i, self.num_quantizers * self.num_vertices_per_face)
 
-            # example below for triangles, extrapolate for quads
-            # v1([q1] [q2] [q1] [q2] [q1] [q2]) v2([eos| q1] [q2] [q1] [q2] [q1] [q2]) -> 0 1 2 3 4 5 6 7 8 9 10 11 12 -> v1(F F F F F F) v2(T F F F F F) v3(T F F F F F)
-
-            can_eos = i != 0 and divisible_by(i,
-                                              self.num_quantizers * self.num_vertices_per_face)  # only allow for eos to be decoded at the end of each face, defined as 3 or 4 vertices with D residual VQ codes
-
-            output = self.forward_on_codes(
-                codes,
-                text_embeds=text_embeds,
-                return_loss=False,
-                return_cache=cache_kv,
-                append_eos=False,
-                cond_scale=cond_scale,
-                cfg_routed_kwargs=dict(
-                    cache=cache
-                )
-            )
+            out = self.forward_on_codes(codes, text_embeds=text_embeds, return_loss=False, return_cache=cache_kv,
+                                        append_eos=False, cond_scale=cond_scale, cfg_routed_kwargs=dict(cache=cache))
 
             if cache_kv:
-                logits, cache = output
-
+                logits, cache = out
                 if cond_scale == 1.:
                     cache = (cache, None)
             else:
-                logits = output
+                logits = out
 
             logits = logits[:, -1]
 
             if not can_eos:
                 logits[:, -1] = -torch.finfo(logits.dtype).max
 
-            filtered_logits = filter_logits_fn(logits, **filter_kwargs)
+            fl = filter_logits_fn(logits, **filter_kwargs)
 
             if temperature == 0.:
-                sample = filtered_logits.argmax(dim=-1)
+                samp = fl.argmax(dim=-1)
             else:
-                probs = F.softmax(filtered_logits / temperature, dim=-1)
-                sample = torch.multinomial(probs, 1)
+                probs = F.softmax(fl / temperature, dim=-1)
+                samp = torch.multinomial(probs, 1)
 
-            codes, _ = pack([codes, sample], 'b *')
+            codes, _ = pack([codes, samp], 'b *')
 
-            # check for all rows to have [eos] to terminate
-
-            is_eos_codes = (codes == self.eos_token_id)
-
-            if is_eos_codes.any(dim=-1).all():
+            is_eos = (codes == self.eos_token_id)
+            if is_eos.any(dim=-1).all():
                 break
 
-        # mask out to padding anything after the first eos
+        msk = is_eos.float().cumsum(dim=-1) >= 1
+        codes = codes.masked_fill(msk, self.pad_id)
 
-        mask = is_eos_codes.float().cumsum(dim=-1) >= 1
-        codes = codes.masked_fill(mask, self.pad_id)
-
-        # remove a potential extra token from eos, if breaked early
-
-        code_len = codes.shape[-1]
-        round_down_code_len = code_len // self.num_vertices_per_face * self.num_vertices_per_face
-        codes = codes[:, :round_down_code_len]
-
-        # early return of raw residual quantizer codes
+        cl = codes.shape[-1]
+        rd_cl = cl // self.num_vertices_per_face * self.num_vertices_per_face
+        codes = codes[:, :rd_cl]
 
         if return_codes:
             codes = rearrange(codes, 'b (n q) -> b n q', q=self.num_quantizers)
             return codes
 
-        # # If we are using BPT tokens (i.e. model.bpt_vocab_size is configured and dataset codes are BPT),
-        # # decode with BPT_deserialize. Otherwise fall back to autoencoder decode_from_codes_to_faces.
-        # if self.use_bpt:
-        #     # codes: (B, L) where each element is a raw BPT token id (padded with self.pad_id)
-        #     vertices_list = []
-        #     codes_np = codes.detach().cpu().numpy()
-        #     for i in range(codes_np.shape[0]):
-        #         row = codes_np[i]
-        #         # remove pad values (if padded with self.pad_id)
-        #         if self.pad_id is not None:
-        #             row = row[row != self.pad_id]
-        #         # if no tokens left return empty array
-        #         if row.size == 0:
-        #             vertices_list.append(np.zeros((0, 3)))
-        #             continue
-        #         try:
-        #             verts = BPT_deserialize(row, block_size=getattr(self, "bpt_block_size", 16),
-        #                                     offset_size=getattr(self, "bpt_offset_size", 16),
-        #                                     compressed=True,
-        #                                     use_special_block=getattr(self, "bpt_use_special_block", False))
-        #         except Exception:
-        #             verts = np.zeros((0, 3))
-        #         vertices_list.append(verts)
-        #     return vertices_list
-
-
         self.autoencoder.eval()
-        face_coords, face_mask = self.autoencoder.decode_from_codes_to_faces(codes)
+        fc, fm = self.autoencoder.decode_from_codes_to_faces(codes)
 
         if not exists(face_coords_to_file):
-            return face_coords, face_mask
+            return fc, fm
 
-        files = [face_coords_to_file(coords[mask]) for coords, mask in zip(face_coords, face_mask)]
+        files = [face_coords_to_file(coords[mask]) for coords, mask in zip(fc, fm)]
         return files
 
-    def forward(
-            self,
-            *,
-            vertices: Int['b nv 3'],
-            faces: Int['b nf nvf'],
-            face_edges: Int['b e 2'] | None = None,
-            codes: Tensor | None = None,
-            cache: LayerIntermediates | None = None,
-            **kwargs
-    ):
+    def forward(self, *, vertices: Int['b nv 3'], faces: Int['b nf nvf'], face_edges: Int['b e 2'] | None = None,
+                codes: Tensor | None = None, cache=None, **kwargs):
+
         if not exists(codes):
-            codes = self.autoencoder.tokenize(
-                vertices=vertices,
-                faces=faces,
-                face_edges=face_edges
-            )
+            codes = self.autoencoder.tokenize(vertices=vertices, faces=faces, face_edges=face_edges)
 
         return self.forward_on_codes(codes, cache=cache, **kwargs)
 
     @classifier_free_guidance
-    def forward_on_codes(
-            self,
-            codes=None,
-            return_loss=True,
-            return_cache=False,
-            append_eos=True,
-            cache=None,
-            texts: List[str] | None = None,
-            text_embeds: Tensor | None = None,
-            cond_drop_prob=None
-    ):
-        # handle text conditions
+    def forward_on_codes(self, codes=None, return_loss=True, return_cache=False, append_eos=True, cache=None,
+                         texts: List[str] | None = None, text_embeds: Tensor | None = None, cond_drop_prob=None):
 
-        attn_context_kwargs = dict()
+        akw = dict()
 
         if self.condition_on_text:
-            assert exists(texts) ^ exists(
-                text_embeds), '`text` or `text_embeds` must be passed in if `condition_on_text` is set to True'
+            assert exists(texts) ^ exists(text_embeds)
 
             if exists(texts):
                 text_embeds = self.conditioner.embed_texts(texts)
 
             if exists(codes):
-                assert text_embeds.shape[0] == codes.shape[
-                    0], 'batch size of texts or text embeddings is not equal to the batch size of the mesh codes'
+                assert text_embeds.shape[0] == codes.shape[0]
 
-            _, maybe_dropped_text_embeds = self.conditioner(
-                text_embeds=text_embeds,
-                cond_drop_prob=cond_drop_prob
-            )
+            _, mdte = self.conditioner(text_embeds=text_embeds, cond_drop_prob=cond_drop_prob)
+            te, tm = mdte
 
-            text_embed, text_mask = maybe_dropped_text_embeds
+            pte = masked_mean(te, tm, dim=1)
 
-            pooled_text_embed = masked_mean(text_embed, text_mask, dim=1)
-
-            attn_context_kwargs = dict(
-                context=text_embed,
-                context_mask=text_mask
-            )
+            akw = dict(context=te, context_mask=tm)
 
             if self.coarse_adaptive_rmsnorm:
-                attn_context_kwargs.update(
-                    condition=pooled_text_embed
-                )
-
-        # take care of codes that may be flattened
+                akw.update(condition=pte)
 
         if codes.ndim > 2:
             codes = rearrange(codes, 'b ... -> b (...)')
 
-        # get some variable
+        b, sl, dev = *codes.shape, codes.device
 
-        batch, seq_len, device = *codes.shape, codes.device
-
-        assert seq_len <= self.max_seq_len, f'received codes of length {seq_len} but needs to be less than or equal to set max_seq_len {self.max_seq_len}'
-
-        # auto append eos token
+        assert sl <= self.max_seq_len
 
         if append_eos:
             assert exists(codes)
-
-            code_lens = ((codes == self.pad_id).cumsum(dim=-1) == 0).sum(dim=-1)
-
+            cl = ((codes == self.pad_id).cumsum(dim=-1) == 0).sum(dim=-1)
             codes = F.pad(codes, (0, 1), value=0)
-
-            batch_arange = torch.arange(batch, device=device)
-
-            batch_arange = rearrange(batch_arange, '... -> ... 1')
-            code_lens = rearrange(code_lens, '... -> ... 1')
-
-            codes[batch_arange, code_lens] = self.eos_token_id
-
-        # if returning loss, save the labels for cross entropy
+            ba = torch.arange(b, device=dev)
+            ba = rearrange(ba, '... -> ... 1')
+            cl = rearrange(cl, '... -> ... 1')
+            codes[ba, cl] = self.eos_token_id
 
         if return_loss:
-            assert seq_len > 0
+            assert sl > 0
             codes, labels = codes[:, :-1], codes
-
-        # token embed (each residual VQ id)
 
         codes = codes.masked_fill(codes == self.pad_id, 0)
         codes = self.token_embed(codes)
 
-        # codebook embed + absolute positions
+        sa = torch.arange(codes.shape[-2], device=dev)
+        codes = codes + self.abs_pos_emb(sa)
 
-        seq_arange = torch.arange(codes.shape[-2], device=device)
+        cl = codes.shape[1]
 
-        codes = codes + self.abs_pos_emb(seq_arange)
+        le = repeat(self.quantize_level_embed, 'q d -> (r q) d', r=ceil(cl / self.num_quantizers))
+        codes = codes + le[:cl]
 
-        # embedding for quantizer level
+        ve = repeat(self.vertex_embed, 'nv d -> (r nv q) d',
+                    r=ceil(cl / (self.num_vertices_per_face * self.num_quantizers)), q=self.num_quantizers)
+        codes = codes + ve[:cl]
 
-        code_len = codes.shape[1]
+        ntpf = self.num_quantizers * self.num_vertices_per_face
+        cvp = cl % ntpf
+        cl_mult = divisible_by(cl, ntpf)
+        nmc = ceil(cl / ntpf) * ntpf
 
-        level_embed = repeat(self.quantize_level_embed, 'q d -> (r q) d', r=ceil(code_len / self.num_quantizers))
-        codes = codes + level_embed[:code_len]
+        codes = pad_to_length(codes, nmc, dim=-2)
+        gc = rearrange(codes, 'b (nf n) d -> b nf n d', n=ntpf)
 
-        # embedding for each vertex
+        fc = gc if cl_mult else gc[:, :-1]
+        fc = rearrange(fc, 'b nf n d -> b nf (n d)')
+        fc = self.to_face_tokens(fc)
 
-        vertex_embed = repeat(self.vertex_embed, 'nv d -> (r nv q) d',
-                              r=ceil(code_len / (self.num_vertices_per_face * self.num_quantizers)),
-                              q=self.num_quantizers)
-        codes = codes + vertex_embed[:code_len]
+        fcl = fc.shape[-2]
 
-        # create a token per face, by summarizing the 3 or 4 vertices
-        # this is similar in design to the RQ transformer from Lee et al. https://arxiv.org/abs/2203.01941
-
-        num_tokens_per_face = self.num_quantizers * self.num_vertices_per_face
-
-        curr_vertex_pos = code_len % num_tokens_per_face  # the current intra-face vertex-code position id, needed for caching at the fine decoder stage
-
-        code_len_is_multiple_of_face = divisible_by(code_len, num_tokens_per_face)
-
-        next_multiple_code_len = ceil(code_len / num_tokens_per_face) * num_tokens_per_face
-
-        codes = pad_to_length(codes, next_multiple_code_len, dim=-2)
-
-        # grouped codes will be used for the second stage
-
-        grouped_codes = rearrange(codes, 'b (nf n) d -> b nf n d', n=num_tokens_per_face)
-
-        # create the coarse tokens for the first attention network
-
-        face_codes = grouped_codes if code_len_is_multiple_of_face else grouped_codes[:, :-1]
-        face_codes = rearrange(face_codes, 'b nf n d -> b nf (n d)')
-        face_codes = self.to_face_tokens(face_codes)
-
-        face_codes_len = face_codes.shape[-2]
-
-        # cache logic
-
-        (
-            cached_attended_face_codes,
-            coarse_cache,
-            fine_cache,
-            coarse_gateloop_cache,
-            coarse_post_gateloop_cache,
-            fine_gateloop_cache
-        ) = cache if exists(cache) else ((None,) * 6)
+        (cafc, cc, finec, cglc, cpglc, fglc) = cache if exists(cache) else ((None,) * 6)
 
         if exists(cache):
-            cached_face_codes_len = cached_attended_face_codes.shape[-2]
-            cached_face_codes_len_without_sos = cached_face_codes_len - 1
-
-            need_call_first_transformer = face_codes_len > cached_face_codes_len_without_sos
+            cfcl = cafc.shape[-2]
+            cfcl_nos = cfcl - 1
+            ncft = fcl > cfcl_nos
         else:
-            # auto prepend sos token
+            sos = repeat(self.sos_token, 'n d -> b n d', b=b)
+            fc, pss = pack([sos, fc], 'b * d')
+            ncft = True
 
-            sos = repeat(self.sos_token, 'n d -> b n d', b=batch)
-            face_codes, packed_sos_shape = pack([sos, face_codes], 'b * d')
-
-            # if no kv cache, always call first transformer
-
-            need_call_first_transformer = True
-
-        should_cache_fine = not divisible_by(curr_vertex_pos + 1, num_tokens_per_face)
-
-        # condition face codes with text if needed
+        scf = not divisible_by(cvp + 1, ntpf)
 
         if self.condition_on_text:
-            face_codes = self.text_coarse_film_cond(face_codes, pooled_text_embed)
+            fc = self.text_coarse_film_cond(fc, pte)
 
-        # attention on face codes (coarse)
-
-        if need_call_first_transformer:
+        if ncft:
             if exists(self.coarse_gateloop_block):
-                face_codes, coarse_gateloop_cache = self.coarse_gateloop_block(face_codes, cache=coarse_gateloop_cache)
+                fc, cglc = self.coarse_gateloop_block(fc, cache=cglc)
 
-            attended_face_codes, coarse_cache = self.decoder(
-                face_codes,
-                cache=coarse_cache,
-                return_hiddens=True,
-                **attn_context_kwargs
-            )
+            afc, cc = self.decoder(fc, cache=cc, return_hiddens=True, **akw)
 
             if exists(self.coarse_post_gateloop_block):
-                face_codes, coarse_post_gateloop_cache = self.coarse_post_gateloop_block(face_codes,
-                                                                                         cache=coarse_post_gateloop_cache)
-
+                fc, cpglc = self.coarse_post_gateloop_block(fc, cache=cpglc)
         else:
-            attended_face_codes = None
+            afc = None
 
-        attended_face_codes = safe_cat((cached_attended_face_codes, attended_face_codes), dim=-2)
-
-        # if calling without kv cache, pool the sos tokens, if greater than 1 sos token
+        afc = safe_cat((cafc, afc), dim=-2)
 
         if not exists(cache):
-            sos_tokens, attended_face_codes = unpack(attended_face_codes, packed_sos_shape, 'b * d')
-            last_sos_token = sos_tokens[:, -1:]
-            attended_face_codes = torch.cat((last_sos_token, attended_face_codes), dim=1)
+            st, afc = unpack(afc, pss, 'b * d')
+            lst = st[:, -1:]
+            afc = torch.cat((lst, afc), dim=1)
 
-        # maybe project from coarse to fine dimension for hierarchical transformers
+        afc = self.maybe_project_coarse_to_fine(afc)
 
-        attended_face_codes = self.maybe_project_coarse_to_fine(attended_face_codes)
-
-        grouped_codes = pad_to_length(grouped_codes, attended_face_codes.shape[-2], dim=1)
-        fine_vertex_codes, _ = pack([attended_face_codes, grouped_codes], 'b n * d')
-
-        fine_vertex_codes = fine_vertex_codes[..., :-1, :]
-
-        # gateloop layers
+        gc = pad_to_length(gc, afc.shape[-2], dim=1)
+        fvc, _ = pack([afc, gc], 'b n * d')
+        fvc = fvc[..., :-1, :]
 
         if exists(self.fine_gateloop_block):
-            fine_vertex_codes = rearrange(fine_vertex_codes, 'b nf n d -> b (nf n) d')
-            orig_length = fine_vertex_codes.shape[-2]
-            fine_vertex_codes = fine_vertex_codes[:, :(code_len + 1)]
-
-            fine_vertex_codes, fine_gateloop_cache = self.fine_gateloop_block(fine_vertex_codes,
-                                                                              cache=fine_gateloop_cache)
-
-            fine_vertex_codes = pad_to_length(fine_vertex_codes, orig_length, dim=-2)
-            fine_vertex_codes = rearrange(fine_vertex_codes, 'b (nf n) d -> b nf n d', n=num_tokens_per_face)
-
-        # fine attention - 2nd stage
+            fvc = rearrange(fvc, 'b nf n d -> b (nf n) d')
+            ol = fvc.shape[-2]
+            fvc = fvc[:, :(cl + 1)]
+            fvc, fglc = self.fine_gateloop_block(fvc, cache=fglc)
+            fvc = pad_to_length(fvc, ol, dim=-2)
+            fvc = rearrange(fvc, 'b (nf n) d -> b nf n d', n=ntpf)
 
         if exists(cache):
-            fine_vertex_codes = fine_vertex_codes[:, -1:]
+            fvc = fvc[:, -1:]
 
-            if exists(fine_cache):
-                for attn_intermediate in fine_cache.attn_intermediates:
-                    ck, cv = attn_intermediate.cached_kv
-                    ck, cv = [rearrange(t, '(b nf) ... -> b nf ...', b=batch) for t in (ck, cv)]
+            if exists(finec):
+                for ai in finec.attn_intermediates:
+                    ck, cv = ai.cached_kv
+                    ck, cv = [rearrange(t, '(b nf) ... -> b nf ...', b=b) for t in (ck, cv)]
 
-                    # when operating on the cached key / values, treat self attention and cross attention differently
+                    lt = ai.layer_type
 
-                    layer_type = attn_intermediate.layer_type
-
-                    if layer_type == 'a':
-                        ck, cv = [t[:, -1, :, :curr_vertex_pos] for t in (ck, cv)]
-                    elif layer_type == 'c':
+                    if lt == 'a':
+                        ck, cv = [t[:, -1, :, :cvp] for t in (ck, cv)]
+                    elif lt == 'c':
                         ck, cv = [t[:, -1, ...] for t in (ck, cv)]
 
-                    attn_intermediate.cached_kv = (ck, cv)
+                    ai.cached_kv = (ck, cv)
 
-        num_faces = fine_vertex_codes.shape[1]
-        one_face = num_faces == 1
+        nf = fvc.shape[1]
+        of = nf == 1
 
-        fine_vertex_codes = rearrange(fine_vertex_codes, 'b nf n d -> (b nf) n d')
+        fvc = rearrange(fvc, 'b nf n d -> (b nf) n d')
 
-        if one_face:
-            fine_vertex_codes = fine_vertex_codes[:, :(curr_vertex_pos + 1)]
+        if of:
+            fvc = fvc[:, :(cvp + 1)]
 
-        # handle maybe cross attention conditioning of fine transformer with text
-
-        fine_attn_context_kwargs = dict()
-
-        # optional text cross attention conditioning for fine transformer
+        fakw = dict()
 
         if self.fine_cross_attend_text:
-            repeat_batch = fine_vertex_codes.shape[0] // text_embed.shape[0]
-
-            text_embed = repeat(text_embed, 'b ... -> (b r) ...', r=repeat_batch)
-            text_mask = repeat(text_mask, 'b ... -> (b r) ...', r=repeat_batch)
-
-            fine_attn_context_kwargs = dict(
-                context=text_embed,
-                context_mask=text_mask
-            )
-
-        # also film condition the fine vertex codes
+            rb = fvc.shape[0] // te.shape[0]
+            te = repeat(te, 'b ... -> (b r) ...', r=rb)
+            tm = repeat(tm, 'b ... -> (b r) ...', r=rb)
+            fakw = dict(context=te, context_mask=tm)
 
         if self.condition_on_text:
-            repeat_batch = fine_vertex_codes.shape[0] // pooled_text_embed.shape[0]
+            rb = fvc.shape[0] // pte.shape[0]
+            pte = repeat(pte, 'b ... -> (b r) ...', r=rb)
+            fvc = self.text_fine_film_cond(fvc, pte)
 
-            pooled_text_embed = repeat(pooled_text_embed, 'b ... -> (b r) ...', r=repeat_batch)
-            fine_vertex_codes = self.text_fine_film_cond(fine_vertex_codes, pooled_text_embed)
+        avc, finec = self.fine_decoder(fvc, cache=finec, **fakw, return_hiddens=True)
 
-        # fine transformer
+        if not scf:
+            finec = None
 
-        attended_vertex_codes, fine_cache = self.fine_decoder(
-            fine_vertex_codes,
-            cache=fine_cache,
-            **fine_attn_context_kwargs,
-            return_hiddens=True
-        )
-
-        if not should_cache_fine:
-            fine_cache = None
-
-        if not one_face:
-            # reconstitute original sequence
-
-            embed = rearrange(attended_vertex_codes, '(b nf) n d -> b (nf n) d', b=batch)
-            embed = embed[:, :(code_len + 1)]
+        if not of:
+            emb = rearrange(avc, '(b nf) n d -> b (nf n) d', b=b)
+            emb = emb[:, :(cl + 1)]
         else:
-            embed = attended_vertex_codes
+            emb = avc
 
-        # logits
-
-        logits = self.to_logits(embed)
+        logits = self.to_logits(emb)
 
         if not return_loss:
             if not return_cache:
                 return logits
 
-            next_cache = (
-                attended_face_codes,
-                coarse_cache,
-                fine_cache,
-                coarse_gateloop_cache,
-                coarse_post_gateloop_cache,
-                fine_gateloop_cache
-            )
+            nc = (afc, cc, finec, cglc, cpglc, fglc)
+            return logits, nc
 
-            return logits, next_cache
-
-        # loss
-
-        ce_loss = F.cross_entropy(
-            rearrange(logits, 'b n c -> b c n'),
-            labels,
-            ignore_index=self.pad_id
-        )
-
-        return ce_loss
+        cel = F.cross_entropy(rearrange(logits, 'b n c -> b c n'), labels, ignore_index=self.pad_id)
+        return cel
