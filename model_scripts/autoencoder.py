@@ -99,13 +99,13 @@ class MeshAutoencoder(Module):
         self.init_sage_conv = SAGEConv(dim_codebook, init_enc_dim, **sageconv_kwargs)
         self.init_encoder_act_and_norm = nn.Sequential(nn.SiLU(), nn.LayerNorm(init_enc_dim))
 
-        self.encoders = ModuleList([])
+        self.encoders = nn.ModuleList([])
         curr = init_enc_dim
         for d in enc_dims:
             self.encoders.append(SAGEConv(curr, d, **sageconv_kwargs))
             curr = d
 
-        self.encoder_attn_blocks = ModuleList([])
+        self.encoder_attn_blocks = nn.ModuleList([])
         for _ in range(attn_encoder_depth):
             self.encoder_attn_blocks.append(nn.ModuleList([
                 TaylorSeriesLinearAttn(curr, prenorm=True, **linear_attn_kwargs) if use_linear_attn else None,
@@ -128,7 +128,7 @@ class MeshAutoencoder(Module):
                                         stochastic_sample_codes=rvq_stochastic_sample_codes, **rvq_kwargs, **rq_kwargs)
 
         dec_input_dim = dim_codebook * 3
-        self.decoder_attn_blocks = ModuleList([])
+        self.decoder_attn_blocks = nn.ModuleList([])
         for _ in range(attn_decoder_depth):
             self.decoder_attn_blocks.append(nn.ModuleList([
                 TaylorSeriesLinearAttn(dec_input_dim, prenorm=True, **linear_attn_kwargs) if use_linear_attn else None,
@@ -142,7 +142,7 @@ class MeshAutoencoder(Module):
                       padding=init_decoder_conv_kernel // 2),
             nn.SiLU(), Rearrange('b c n -> b n c'), nn.LayerNorm(init_dec_dim), Rearrange('b n c -> b c n'))
 
-        self.decoders = ModuleList([])
+        self.decoders = nn.ModuleList([])
         curr = init_dec_dim
         for d in dec_dims:
             self.decoders.append(ResnetBlock(curr, d, dropout=resnet_dropout))
@@ -160,121 +160,124 @@ class MeshAutoencoder(Module):
     def encode(self, *, vertices: Float['b nv 3'], faces: Int['b nf nvf'], face_edges: Int['b e 2'],
                face_mask: Bool['b nf'], face_edges_mask: Bool['b e'], return_face_coordinates=False):
 
-        face_no_pad = faces.masked_fill(~rearrange(face_mask, 'b nf -> b nf 1'), 0)
-        fc = get_at('b [nv] c, b nf mv -> b nf mv c', vertices, face_no_pad)
+        face_without_pad = faces.masked_fill(~rearrange(face_mask, 'b nf -> b nf 1'), 0)
+        face_coords = get_at('b [nv] c, b nf mv -> b nf mv c', vertices, face_without_pad)
 
-        feat = get_derived_face_features(fc)
-        ang = self.angle_embed(self.discretize_angle(feat['angles']))
-        ar = self.area_embed(self.discretize_area(feat['area']))
-        nrm = self.normal_embed(self.discretize_normals(feat['normals']))
+        derived_features = get_derived_face_features(face_coords)
+        discrete_angle = self.discretize_angle(derived_features['angles'])
+        angle_embed = self.angle_embed(discrete_angle)
+        discrete_area = self.discretize_area(derived_features['area'])
+        area_embed = self.area_embed(discrete_area)
+        discrete_normal = self.discretize_normals(derived_features['normals'])
+        normal_embed = self.normal_embed(discrete_normal)
 
-        dfc = self.discretize_face_coords(fc)
-        dfc = rearrange(dfc, 'b nf nv c -> b nf (nv c)')
-        fce = self.coor_embed(dfc)
-        fce = rearrange(fce, 'b nf c d -> b nf (c d)')
+        discrete_face_coords = self.discretize_face_coords(face_coords)
+        discrete_face_coords = rearrange(discrete_face_coords, 'b nf nv c -> b nf (nv c)')
+        face_coor_embed = self.coor_embed(discrete_face_coords)
+        face_coor_embed = rearrange(face_coor_embed, 'b nf c d -> b nf (c d)')
 
-        emb, _ = pack([fce, ang, ar, nrm], 'b nf *')
-        emb = self.project_in(emb)
+        face_embed, _ = pack([face_coor_embed, angle_embed, area_embed, normal_embed], 'b nf *')
+        face_embed = self.project_in(face_embed)
 
-        fo = reduce(face_mask.long(), 'b nf -> b', 'sum')
-        fo = F.pad(fo.cumsum(dim=0), (1, -1), value=0)
-        fo = rearrange(fo, 'b -> b 1 1')
+        face_index_offsets = reduce(face_mask.long(), 'b nf -> b', 'sum')
+        face_index_offsets = F.pad(face_index_offsets.cumsum(dim=0), (1, -1), value=0)
+        face_index_offsets = rearrange(face_index_offsets, 'b -> b 1 1')
 
-        fe = face_edges + fo
-        fe = fe[face_edges_mask]
-        fe = rearrange(fe, 'be ij -> ij be')
+        face_edges = face_edges + face_index_offsets
+        face_edges = face_edges[face_edges_mask]
+        face_edges = rearrange(face_edges, 'be ij -> ij be')
 
-        orig_shape = emb.shape[:2]
-        emb = emb[face_mask]
+        orig_face_embed_shape = face_embed.shape[:2]
+        face_embed = face_embed[face_mask]
 
-        emb = self.init_sage_conv(emb, fe)
-        emb = self.init_encoder_act_and_norm(emb)
+        face_embed = self.init_sage_conv(face_embed, face_edges)
+        face_embed = self.init_encoder_act_and_norm(face_embed)
 
         for conv in self.encoders:
-            emb = conv(emb, fe)
+            face_embed = conv(face_embed, face_edges)
 
-        shape = (*orig_shape, emb.shape[-1])
-        emb = emb.new_zeros(shape).masked_scatter(rearrange(face_mask, '... -> ... 1'), emb)
+        shape = (*orig_face_embed_shape, face_embed.shape[-1])
+        face_embed = face_embed.new_zeros(shape).masked_scatter(rearrange(face_mask, '... -> ... 1'), face_embed)
 
-        for lin_attn, attn, ff in self.encoder_attn_blocks:
-            if exists(lin_attn):
-                emb = lin_attn(emb, mask=face_mask) + emb
-            emb = attn(emb, mask=face_mask) + emb
-            emb = ff(emb) + emb
+        for linear_attn, attn, ff in self.encoder_attn_blocks:
+            if exists(linear_attn):
+                face_embed = linear_attn(face_embed, mask=face_mask) + face_embed
+            face_embed = attn(face_embed, mask=face_mask) + face_embed
+            face_embed = ff(face_embed) + face_embed
 
-        return (emb, dfc) if return_face_coordinates else emb
+        return (face_embed, discrete_face_coords) if return_face_coordinates else face_embed
 
     @typecheck
     def quantize(self, *, faces: Int['b nf nvf'], face_mask: Bool['b n'], face_embed: Float['b nf d'],
                  pad_id=None, rvq_sample_codebook_temp=1.):
 
         pad_id = default(pad_id, self.pad_id)
-        b, dev = faces.shape[0], faces.device
+        batch, device = faces.shape[0], faces.device
 
-        mx = faces.amax()
-        nv = int(mx.item() + 1)
+        max_vertex_index = faces.amax()
+        num_vertices = int(max_vertex_index.item() + 1)
 
-        fe = self.project_dim_codebook(face_embed)
-        fe = rearrange(fe, 'b nf (nvf d) -> b nf nvf d', nvf=self.num_vertices_per_face)
+        face_embed = self.project_dim_codebook(face_embed)
+        face_embed = rearrange(face_embed, 'b nf (nvf d) -> b nf nvf d', nvf=self.num_vertices_per_face)
 
-        vd = fe.shape[-1]
-        verts = torch.zeros((b, nv, vd), device=dev)
+        vertex_dim = face_embed.shape[-1]
+        vertices = torch.zeros((batch, num_vertices, vertex_dim), device=device)
 
-        pad_v_id = nv
-        verts = pad_at_dim(verts, (0, 1), dim=-2, value=0.)
-        faces = faces.masked_fill(~rearrange(face_mask, 'b n -> b n 1'), pad_v_id)
+        pad_vertex_id = num_vertices
+        vertices = pad_at_dim(vertices, (0, 1), dim=-2, value=0.)
+        faces = faces.masked_fill(~rearrange(face_mask, 'b n -> b n 1'), pad_vertex_id)
 
-        f_dim = repeat(faces, 'b nf nvf -> b (nf nvf) d', d=vd)
-        fe = rearrange(fe, 'b ... d -> b (...) d')
-        avg_v = scatter_mean(verts, f_dim, fe, dim=-2)
+        faces_with_dim = repeat(faces, 'b nf nvf -> b (nf nvf) d', d=vertex_dim)
+        face_embed = rearrange(face_embed, 'b ... d -> b (...) d')
+        averaged_vertices = scatter_mean(vertices, faces_with_dim, face_embed, dim=-2)
 
-        msk = torch.ones((b, nv + 1), device=dev, dtype=torch.bool)
-        msk[:, -1] = False
+        mask = torch.ones((batch, num_vertices + 1), device=device, dtype=torch.bool)
+        mask[:, -1] = False
 
-        qkw = dict()
+        quantize_kwargs = dict()
         if not isinstance(self.quantizer, ResidualSimVQ):
-            qkw.update(mask=msk)
+            quantize_kwargs.update(mask=mask)
         if isinstance(self.quantizer, ResidualVQ):
-            qkw.update(sample_codebook_temp=rvq_sample_codebook_temp)
+            quantize_kwargs.update(sample_codebook_temp=rvq_sample_codebook_temp)
 
-        def q_wrap(inp):
-            unq, kw = inp
-            return self.quantizer(unq, **kw)
+        def quantize_wrapper_fn(inp):
+            unquantized, quantize_kwargs = inp
+            return self.quantizer(unquantized, **quantize_kwargs)
 
         if self.checkpoint_quantizer:
-            q_wrap = partial(checkpoint, q_wrap, use_reentrant=False)
+            quantize_wrapper_fn = partial(checkpoint, quantize_wrapper_fn, use_reentrant=False)
 
-        quant, codes, cl = q_wrap((avg_v, qkw))
+        quantized, codes, commit_loss = quantize_wrapper_fn((averaged_vertices, quantize_kwargs))
 
         if isinstance(self.quantizer, ResidualSimVQ):
-            quant = quant * msk.unsqueeze(-1)
-            codes = codes * msk.unsqueeze(-1).long()
+            quantized = quantized * mask.unsqueeze(-1)
+            codes = codes * mask.unsqueeze(-1).long()
 
-        fe_out = get_at('b [n] d, b nf nvf -> b nf (nvf d)', quant, faces)
-        c_out = get_at('b [n] q, b nf nvf -> b (nf nvf) q', codes, faces)
+        face_embed_output = get_at('b [n] d, b nf nvf -> b nf (nvf d)', quantized, faces)
+        codes_output = get_at('b [n] q, b nf nvf -> b (nf nvf) q', codes, faces)
 
-        fm = repeat(face_mask, 'b nf -> b (nf nvf) 1', nvf=self.num_vertices_per_face)
-        c_out = c_out.masked_fill(~fm, self.pad_id)
+        face_mask = repeat(face_mask, 'b nf -> b (nf nvf) 1', nvf=self.num_vertices_per_face)
+        codes_output = codes_output.masked_fill(~face_mask, self.pad_id)
 
-        return fe_out, c_out, cl
+        return face_embed_output, codes_output, commit_loss
 
     @typecheck
     def decode(self, quantized: Float['b n d'], face_mask: Bool['b n']):
-        cfm = rearrange(face_mask, 'b n -> b 1 n')
+        conv_face_mask = rearrange(face_mask, 'b n -> b 1 n')
         x = quantized
 
-        for lin_attn, attn, ff in self.decoder_attn_blocks:
-            if exists(lin_attn):
-                x = lin_attn(x, mask=face_mask) + x
+        for linear_attn, attn, ff in self.decoder_attn_blocks:
+            if exists(linear_attn):
+                x = linear_attn(x, mask=face_mask) + x
             x = attn(x, mask=face_mask) + x
             x = ff(x) + x
 
         x = rearrange(x, 'b n d -> b d n')
-        x = x.masked_fill(~cfm, 0.)
+        x = x.masked_fill(~conv_face_mask, 0.)
         x = self.init_decoder_conv(x)
 
-        for rb in self.decoders:
-            x = rb(x, mask=cfm)
+        for resnet_block in self.decoders:
+            x = resnet_block(x, mask=conv_face_mask)
 
         return rearrange(x, 'b d n -> b n d')
 
@@ -282,10 +285,10 @@ class MeshAutoencoder(Module):
     @torch.no_grad()
     def decode_from_codes_to_faces(self, codes: Tensor, face_mask: Bool['b n'] | None = None,
                                    return_discrete_codes=False):
-        dev = next(self.parameters()).device
+        device = next(self.parameters()).device
         if not isinstance(codes, torch.Tensor):
             codes = torch.as_tensor(codes)
-        codes = codes.to(dev)
+        codes = codes.to(device)
 
         codes = rearrange(codes, 'b ... -> b (...)')
 
@@ -295,39 +298,41 @@ class MeshAutoencoder(Module):
 
         codes = rearrange(codes, 'b (n q) -> b n q', q=self.num_quantizers)
 
-        quant = self.quantizer.get_output_from_indices(codes)
-        quant = rearrange(quant, 'b (nf nvf) d -> b nf (nvf d)', nvf=self.num_vertices_per_face)
+        quantized = self.quantizer.get_output_from_indices(codes)
+        quantized = rearrange(quantized, 'b (nf nvf) d -> b nf (nvf d)', nvf=self.num_vertices_per_face)
 
-        dec = self.decode(quant, face_mask=face_mask)
-        dec = dec.masked_fill(~face_mask[..., None], 0.)
-        pfc = self.to_coor_logits(dec)
-        pfc = pfc.argmax(dim=-1)
-        pfc = rearrange(pfc, '... (v c) -> ... v c', v=self.num_vertices_per_face)
+        decoded = self.decode(quantized, face_mask=face_mask)
+        decoded = decoded.masked_fill(~face_mask[..., None], 0.)
+        pred_face_coords = self.to_coor_logits(decoded)
+        pred_face_coords = pred_face_coords.argmax(dim=-1)
+        pred_face_coords = rearrange(pred_face_coords, '... (v c) -> ... v c', v=self.num_vertices_per_face)
 
-        cont = undiscretize(pfc, num_discrete=self.num_discrete_coors, continuous_range=self.coor_continuous_range)
-        cont = cont.masked_fill(~rearrange(face_mask, 'b nf -> b nf 1 1'), float('nan'))
+        continuous_coors = undiscretize(pred_face_coords, num_discrete=self.num_discrete_coors,
+                                        continuous_range=self.coor_continuous_range)
+        continuous_coors = continuous_coors.masked_fill(~rearrange(face_mask, 'b nf -> b nf 1 1'), float('nan'))
 
-        return (cont, pfc, face_mask) if return_discrete_codes else (cont, face_mask)
+        return (continuous_coors, pred_face_coords, face_mask) if return_discrete_codes else (continuous_coors,
+                                                                                              face_mask)
 
     @torch.no_grad()
     def tokenize(self, vertices, faces, face_edges=None, **kwargs):
         assert 'return_codes' not in kwargs
 
-        inp = [vertices, faces, face_edges]
-        inp = [*filter(exists, inp)]
-        nd = {i.ndim for i in inp}
+        inputs = [vertices, faces, face_edges]
+        inputs = [*filter(exists, inputs)]
+        ndims = {i.ndim for i in inputs}
 
-        assert len(nd) == 1
-        bl = first(list(nd)) == 2
+        assert len(ndims) == 1
+        batch_less = first(list(ndims)) == 2
 
-        if bl:
-            inp = [rearrange(i, '... -> 1 ...') for i in inp]
+        if batch_less:
+            inputs = [rearrange(i, '... -> 1 ...') for i in inputs]
 
-        ikw = dict(zip(['vertices', 'faces', 'face_edges'], inp))
+        input_kwargs = dict(zip(['vertices', 'faces', 'face_edges'], inputs))
         self.eval()
-        codes = self.forward(**ikw, return_codes=True, **kwargs)
+        codes = self.forward(**input_kwargs, return_codes=True, **kwargs)
 
-        if bl:
+        if batch_less:
             codes = rearrange(codes, '1 ... -> ...')
 
         return codes
@@ -340,50 +345,52 @@ class MeshAutoencoder(Module):
         if not exists(face_edges):
             face_edges = derive_face_edges_from_faces(faces, pad_id=self.pad_id)
 
-        fm = reduce(faces != self.pad_id, 'b nf c -> b nf', 'all')
-        fem = reduce(face_edges != self.pad_id, 'b e ij -> b e', 'all')
+        face_mask = reduce(faces != self.pad_id, 'b nf c -> b nf', 'all')
+        face_edges_mask = reduce(face_edges != self.pad_id, 'b e ij -> b e', 'all')
 
-        enc, fc = self.encode(vertices=vertices, faces=faces, face_edges=face_edges,
-                              face_edges_mask=fem, face_mask=fm, return_face_coordinates=True)
+        encoded, face_coordinates = self.encode(vertices=vertices, faces=faces, face_edges=face_edges,
+                                                face_edges_mask=face_edges_mask, face_mask=face_mask,
+                                                return_face_coordinates=True)
 
-        quant, codes, cl = self.quantize(face_embed=enc, faces=faces, face_mask=fm,
-                                         rvq_sample_codebook_temp=rvq_sample_codebook_temp)
+        quantized, codes, commit_loss = self.quantize(face_embed=encoded, faces=faces, face_mask=face_mask,
+                                                      rvq_sample_codebook_temp=rvq_sample_codebook_temp)
 
         if return_codes:
-            codes = codes.masked_fill(~repeat(fm, 'b nf -> b (nf nvf) 1', nvf=self.num_vertices_per_face), self.pad_id)
+            codes = codes.masked_fill(~repeat(face_mask, 'b nf -> b (nf nvf) 1', nvf=self.num_vertices_per_face),
+                                      self.pad_id)
             return codes
 
-        dec = self.decode(quant, face_mask=fm)
-        pfc = self.to_coor_logits(dec)
+        decode = self.decode(quantized, face_mask=face_mask)
+        pred_face_coords = self.to_coor_logits(decode)
 
         if return_recon_faces or only_return_recon_faces:
-            rf = undiscretize(pfc.argmax(dim=-1), num_discrete=self.num_discrete_coors,
-                              continuous_range=self.coor_continuous_range)
-            rf = rearrange(rf, 'b nf (nvf c) -> b nf nvf c', nvf=self.num_vertices_per_face)
-            fm_exp = rearrange(fm, 'b nf -> b nf 1 1')
-            rf = rf.masked_fill(~fm_exp, float('nan'))
+            recon_faces = undiscretize(pred_face_coords.argmax(dim=-1), num_discrete=self.num_discrete_coors,
+                                       continuous_range=self.coor_continuous_range)
+            recon_faces = rearrange(recon_faces, 'b nf (nvf c) -> b nf nvf c', nvf=self.num_vertices_per_face)
+            face_mask_exp = rearrange(face_mask, 'b nf -> b nf 1 1')
+            recon_faces = recon_faces.masked_fill(~face_mask_exp, float('nan'))
 
         if only_return_recon_faces:
-            return rf
+            return recon_faces
 
-        pfc = rearrange(pfc, 'b ... c -> b c (...)')
-        fc = rearrange(fc, 'b ... -> b 1 (...)')
+        pred_face_coords = rearrange(pred_face_coords, 'b ... c -> b c (...)')
+        face_coordinates = rearrange(face_coordinates, 'b ... -> b 1 (...)')
 
         with autocast(enabled=False):
-            plp = pfc.log_softmax(dim=1)
-            toh = torch.zeros_like(plp).scatter(1, fc, 1.)
+            pred_log_prob = pred_face_coords.log_softmax(dim=1)
+            target_one_hot = torch.zeros_like(pred_log_prob).scatter(1, face_coordinates, 1.)
 
             if self.bin_smooth_blur_sigma >= 0.:
-                toh = gaussian_blur_1d(toh, sigma=self.bin_smooth_blur_sigma)
+                target_one_hot = gaussian_blur_1d(target_one_hot, sigma=self.bin_smooth_blur_sigma)
 
-            rl = (-toh * plp).sum(dim=1)
-            fm_exp = repeat(fm, 'b nf -> b (nf r)', r=self.num_vertices_per_face * 3)
-            rl = rl[fm_exp].mean()
+            recon_losses = (-target_one_hot * pred_log_prob).sum(dim=1)
+            face_mask_exp = repeat(face_mask, 'b nf -> b (nf r)', r=self.num_vertices_per_face * 3)
+            recon_loss = recon_losses[face_mask_exp].mean()
 
-        tl = rl + cl.sum() * self.commit_loss_weight
-        lb = (rl, cl)
+        total_loss = recon_loss + commit_loss.sum() * self.commit_loss_weight
+        loss_breakdown = (recon_loss, commit_loss)
 
         if not return_loss_breakdown:
-            return (rf, tl) if return_recon_faces else tl
+            return (recon_faces, total_loss) if return_recon_faces else total_loss
 
-        return (rf, tl, lb) if return_recon_faces else (tl, lb)
+        return (recon_faces, total_loss, loss_breakdown) if return_recon_faces else (total_loss, loss_breakdown)

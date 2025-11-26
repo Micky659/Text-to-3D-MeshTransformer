@@ -1,7 +1,7 @@
 from __future__ import annotations
 from pathlib import Path
 from pytorch_custom_utils import save_load
-from beartype.typing import Tuple, Callable, List
+from beartype.typing import Tuple, Callable, List, Any
 from huggingface_hub import PyTorchModelHubMixin
 from einops import rearrange, repeat, reduce, pack, unpack
 from x_transformers import Decoder
@@ -19,7 +19,7 @@ from model_scripts.autoencoder import MeshAutoencoder
 class GateLoopBlock(Module):
     def __init__(self, dim, *, depth, use_heinsen=True):
         super().__init__()
-        self.gateloops = ModuleList([SimpleGateLoopLayer(dim=dim, use_heinsen=use_heinsen) for _ in range(depth)])
+        self.gateloops = nn.ModuleList([SimpleGateLoopLayer(dim=dim, use_heinsen=use_heinsen) for _ in range(depth)])
 
     def forward(self, x, cache=None):
         rcv = exists(cache)

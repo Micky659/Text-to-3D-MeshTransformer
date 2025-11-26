@@ -33,22 +33,22 @@ class FiLM(Module):
 class PixelNorm(Module):
     def __init__(self, dim, eps=1e-4):
         super().__init__()
-        self.d = dim
-        self.e = eps
+        self.dim = dim
+        self.eps = eps
 
     def forward(self, x):
-        return F.normalize(x, dim=self.d, eps=self.e) * sqrt(x.shape[self.d])
+        return F.normalize(x, dim=self.dim, eps=self.eps) * sqrt(x.shape[self.dim])
 
 
 class SqueezeExcite(Module):
     def __init__(self, dim, reduction_factor=4, min_dim=16):
         super().__init__()
-        di = max(dim // reduction_factor, min_dim)
+        dim_inner = max(dim // reduction_factor, min_dim)
 
         self.net = nn.Sequential(
-            nn.Linear(dim, di),
+            nn.Linear(dim, dim_inner),
             nn.SiLU(),
-            nn.Linear(di, dim),
+            nn.Linear(dim_inner, dim),
             nn.Sigmoid(),
             Rearrange('b c -> b c 1')
         )
@@ -56,13 +56,13 @@ class SqueezeExcite(Module):
     def forward(self, x, mask=None):
         if exists(mask):
             x = x.masked_fill(~mask, 0.)
-            n = reduce(x, 'b c n -> b c', 'sum')
-            d = reduce(mask.float(), 'b 1 n -> b 1', 'sum')
-            a = n / d.clamp(min=1e-5)
+            num = reduce(x, 'b c n -> b c', 'sum')
+            den = reduce(mask.float(), 'b 1 n -> b 1', 'sum')
+            avg = num / den.clamp(min=1e-5)
         else:
-            a = reduce(x, 'b c n -> b c', 'mean')
+            avg = reduce(x, 'b c n -> b c', 'mean')
 
-        return x * self.net(a)
+        return x * self.net(avg)
 
 
 class Block(Module):
@@ -70,23 +70,23 @@ class Block(Module):
         super().__init__()
         dim_out = default(dim_out, dim)
 
-        self.p = nn.Conv1d(dim, dim_out, 3, padding=1)
-        self.n = PixelNorm(dim=1)
-        self.d = nn.Dropout(dropout)
-        self.a = nn.SiLU()
+        self.proj = nn.Conv1d(dim, dim_out, 3, padding=1)
+        self.norm = PixelNorm(dim=1)
+        self.dropout = nn.Dropout(dropout)
+        self.act = nn.SiLU()
 
     def forward(self, x, mask=None):
         if exists(mask):
             x = x.masked_fill(~mask, 0.)
 
-        x = self.p(x)
+        x = self.proj(x)
 
         if exists(mask):
             x = x.masked_fill(~mask, 0.)
 
-        x = self.n(x)
-        x = self.a(x)
-        x = self.d(x)
+        x = self.norm(x)
+        x = self.act(x)
+        x = self.dropout(x)
 
         return x
 
@@ -95,14 +95,14 @@ class ResnetBlock(Module):
     def __init__(self, dim, dim_out=None, *, dropout=0.):
         super().__init__()
         dim_out = default(dim_out, dim)
-        self.b1 = Block(dim, dim_out, dropout=dropout)
-        self.b2 = Block(dim_out, dim_out, dropout=dropout)
-        self.ex = SqueezeExcite(dim_out)
-        self.rc = nn.Conv1d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
+        self.block1 = Block(dim, dim_out, dropout=dropout)
+        self.block2 = Block(dim_out, dim_out, dropout=dropout)
+        self.excite = SqueezeExcite(dim_out)
+        self.residual_conv = nn.Conv1d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
 
     def forward(self, x, mask=None):
-        r = self.rc(x)
-        h = self.b1(x, mask=mask)
-        h = self.b2(h, mask=mask)
-        h = self.ex(h, mask=mask)
+        r = self.residual_conv(x)
+        h = self.block1(x, mask=mask)
+        h = self.block2(h, mask=mask)
+        h = self.excite(h, mask=mask)
         return h + r
